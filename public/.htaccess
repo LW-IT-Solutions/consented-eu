@@ -1,0 +1,56 @@
+# Front controller: everything that is not a real file goes to index.php.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Never rewrite ACME challenges — certificate renewal depends on them.
+    RewriteRule ^\.well-known/acme-challenge/ - [L]
+
+    # Authorization headers are not passed to PHP by default under CGI/FPM.
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ index.php [QSA,L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    # The SDK is embedded by third-party sites, so it must be readable
+    # cross-origin. It contains no secrets and no per-visitor data.
+    <FilesMatch "\.(js|mjs)$">
+        Header set Access-Control-Allow-Origin "*"
+    </FilesMatch>
+</IfModule>
+
+# Scoped to real files on disk. Without the FilesMatch, mod_expires would also
+# fire on PHP responses that happen to be application/javascript — the SDK
+# endpoint — and append a second, conflicting max-age to the one PHP set.
+<FilesMatch "\.(css|js|mjs|svg|png|webp|avif|woff2|ico)$">
+    <IfModule mod_expires.c>
+        ExpiresActive On
+        ExpiresByType text/css                  "access plus 7 days"
+        # Apache 2.4.66+ serves .js as text/javascript, older ones as
+        # application/javascript. Cover both or the SDK goes uncached.
+        ExpiresByType text/javascript           "access plus 7 days"
+        ExpiresByType application/javascript    "access plus 7 days"
+        ExpiresByType image/svg+xml             "access plus 30 days"
+        ExpiresByType image/png                 "access plus 30 days"
+        ExpiresByType image/webp                "access plus 30 days"
+        ExpiresByType font/woff2                "access plus 365 days"
+    </IfModule>
+</FilesMatch>
+
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css text/plain text/xml
+    AddOutputFilterByType DEFLATE application/javascript application/json
+    AddOutputFilterByType DEFLATE image/svg+xml
+</IfModule>
+
+# Nothing outside public/ is reachable, but be explicit about the obvious ones.
+<FilesMatch "^(\.env.*|composer\.(json|lock)|.*\.md|.*\.sql)$">
+    Require all denied
+</FilesMatch>
+
+Options -Indexes
+DirectoryIndex index.php

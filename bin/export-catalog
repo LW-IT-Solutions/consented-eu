@@ -1,0 +1,205 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Schreibt den Dienste-Katalog aus der Datenbank zurück in die Seed-Datei.
+ *
+ *   bin/export-catalog [--dry-run] [--out=pfad]
+ *
+ * WARUM ES DIESES WERKZEUG GIBT
+ * -----------------------------
+ * Der Katalog wächst an zwei Stellen: `bin/import-dps` holt Fremddaten,
+ * `bin/import-patterns` belegt Blocking-Muster, und die Redaktion im Dashboard
+ * ändert Angaben und Prüfstatus. All das landet in der Datenbank — also in
+ * einer einzelnen Installation und in keiner Versionsgeschichte.
+ *
+ * Ohne Rückweg driftet das Repository von der laufenden Instanz weg. Genau das
+ * war passiert: 385 Dienste in der Datenbank, 57 in der Seed-Datei. Wer das
+ * Repository klonte, bekam ein Sechstel des Katalogs, ohne dass es irgendwo
+ * aufgefallen wäre.
+ *
+ * WAS NICHT EXPORTIERT WIRD
+ * -------------------------
+ * Nur Katalogdaten, nichts über die Installation:
+ *
+ *   id, public_id      vergibt jede Installation selbst
+ *   is_active          Schalter des Betreibers, keine Eigenschaft des Dienstes
+ *   verified_by        Fremdschlüssel auf die lokale Nutzertabelle. Exportiert
+ *                      würde er in einer fremden Installation auf einen
+ *                      beliebigen anderen Menschen zeigen
+ *   created_at,        Zeitstempel dieser Datenbank
+ *   updated_at
+ *
+ * Der Prüfstatus samt Datum und Notiz geht dagegen mit: er beschreibt den
+ * Eintrag, nicht die Instanz. Wer den Katalog übernimmt, soll sehen, was
+ * geprüft ist und was nicht.
+ *
+ * LIZENZ
+ * ------
+ * Die Ausgabe ist die abgeleitete Datenbank im Sinne der ODbL 1.0, unter der
+ * der Katalog steht (LICENSE-CATALOG). Sie zu veröffentlichen ist deshalb nicht
+ * nur erlaubt, sondern die Erfüllung von Share-Alike. Fremdanteile bleiben unter
+ * ihrer eigenen Lizenz; die Attribution steht in THIRD_PARTY_DATA.md und muss
+ * mitgegeben werden.
+ *
+ * Exit 0 = geschrieben oder nichts zu tun, 1 = Abbruch.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/export-catalog must be run from the command line.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Db;
+
+$options = getopt('', ['dry-run', 'out::', 'help']);
+
+if (isset($options['help'])) {
+    fwrite(STDOUT, "bin/export-catalog [--dry-run] [--out=pfad]\n");
+    exit(0);
+}
+
+$dryRun = isset($options['dry-run']);
+$target = (string) ($options['out'] ?? (CONSENTED_ROOT . '/database/seeds/dps_catalog.json'));
+
+/**
+ * Spalten in fester Reihenfolge.
+ *
+ * Die Reihenfolge ist Teil der Ausgabe: ein Export, der Felder mal so und mal
+ * anders sortiert, erzeugt bei jedem Lauf einen Diff über die ganze Datei und
+ * macht die Versionsgeschichte unlesbar.
+ */
+const SCALAR_FIELDS = [
+    'dps_id', 'name', 'provider', 'provider_country', 'category', 'legal_basis',
+    'data_retention', 'privacy_policy_url', 'opt_out_url',
+];
+
+/** Spalten, die als JSON in der Datenbank liegen und als Liste heraussollen. */
+const JSON_FIELDS = [
+    'purposes', 'data_collected', 'cookies', 'technologies', 'blocking_pattern',
+    'gcm_signals',
+];
+
+/** Ganzzahlen, die null bleiben dürfen. */
+const INT_FIELDS = ['tcf_vendor_id', 'google_ac_id'];
+
+/** Herkunft und Redaktion. */
+const META_FIELDS = [
+    'pattern_source_type', 'pattern_source_url', 'pattern_verified_at',
+    'source_type', 'source_url', 'source_license', 'source_retrieved_at',
+    'review_status', 'verified_at', 'review_notes',
+];
+
+$rows = Db::all(
+    'SELECT * FROM dps_catalog ORDER BY dps_id'
+);
+
+if ($rows === []) {
+    fwrite(STDERR, "Katalog ist leer — nichts zu exportieren.\n");
+    exit(1);
+}
+
+$out = [];
+
+foreach ($rows as $row) {
+    $entry = [];
+
+    foreach (SCALAR_FIELDS as $field) {
+        $value = $row[$field] ?? null;
+
+        // Leere Zeichenketten und NULL sind in der Ausgabe dasselbe: nicht
+        // gesetzt. provider_country ist der einzige, der null bleiben soll,
+        // weil "" dort ein ungültiger Ländercode wäre.
+        if ($field === 'provider_country') {
+            $entry[$field] = ($value === null || $value === '') ? null : (string) $value;
+            continue;
+        }
+
+        $entry[$field] = (string) ($value ?? '');
+    }
+
+    foreach (JSON_FIELDS as $field) {
+        $decoded = json_decode((string) ($row[$field] ?? '[]'), true);
+        $entry[$field] = is_array($decoded) ? array_values($decoded) : [];
+    }
+
+    foreach (INT_FIELDS as $field) {
+        $entry[$field] = $row[$field] === null ? null : (int) $row[$field];
+    }
+
+    $entry['third_country'] = (bool) ($row['third_country'] ?? false);
+
+    foreach (META_FIELDS as $field) {
+        $value = $row[$field] ?? null;
+        $entry[$field] = ($value === null || $value === '') ? null : (string) $value;
+    }
+
+    $out[] = $entry;
+}
+
+/*
+ * JSON_PRETTY_PRINT und unescaped: die Datei wird von Menschen gelesen und in
+ * Diffs geprüft. JSON_UNESCAPED_SLASHES ist hier wichtig — ohne sie würde jeder
+ * Schrägstrich in jeder URL als \/ geschrieben, was die Datei aufbläht und beim
+ * Wiedereinlesen über Umwege zu genau der Backslash-Verwechslung führt, die uns
+ * schon einmal die Blocking-Muster zerlegt hat.
+ */
+$json = json_encode(
+    $out,
+    JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+);
+
+if ($json === false) {
+    fwrite(STDERR, 'JSON-Kodierung fehlgeschlagen: ' . json_last_error_msg() . "\n");
+    exit(1);
+}
+
+$json .= "\n";
+
+$previous = is_file($target) ? (string) file_get_contents($target) : '';
+$changed  = $previous !== $json;
+
+fwrite(STDOUT, sprintf(
+    "Katalog-Export: %d Einträge, %s\n",
+    count($out),
+    number_format(strlen($json) / 1024, 1, ',', '.') . ' KB'
+));
+
+$byStatus = [];
+$bySource = [];
+
+foreach ($out as $entry) {
+    $byStatus[$entry['review_status'] ?? 'null'] = ($byStatus[$entry['review_status'] ?? 'null'] ?? 0) + 1;
+    $bySource[$entry['source_type'] ?? 'null'] = ($bySource[$entry['source_type'] ?? 'null'] ?? 0) + 1;
+}
+
+foreach ($bySource as $type => $count) {
+    fwrite(STDOUT, sprintf("  %-22s %4d\n", $type, $count));
+}
+
+foreach ($byStatus as $status => $count) {
+    fwrite(STDOUT, sprintf("  review_status=%-9s %4d\n", $status, $count));
+}
+
+$withPatterns = count(array_filter($out, static fn (array $e): bool => $e['blocking_pattern'] !== []));
+fwrite(STDOUT, sprintf("  mit Blocking-Muster    %4d\n", $withPatterns));
+
+if (!$changed) {
+    fwrite(STDOUT, "Datei ist bereits aktuell — nichts geschrieben.\n");
+    exit(0);
+}
+
+if ($dryRun) {
+    fwrite(STDOUT, "Trockenlauf: {$target} würde geschrieben.\n");
+    exit(0);
+}
+
+if (file_put_contents($target, $json) === false) {
+    fwrite(STDERR, "Konnte {$target} nicht schreiben.\n");
+    exit(1);
+}
+
+fwrite(STDOUT, "Geschrieben: {$target}\n");

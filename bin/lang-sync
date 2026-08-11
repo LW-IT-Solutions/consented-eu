@@ -1,0 +1,390 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Pflege der Sprachkataloge.
+ *
+ *   bin/lang-sync --scan              Schlüssel finden, die verwendet, aber nicht definiert sind
+ *   bin/lang-sync --check             Abdeckung je Sprache anzeigen
+ *   bin/lang-sync --import <datei>    Einträge aus JSON einpflegen
+ *   bin/lang-sync --format            Kataloge neu gruppieren und sortieren
+ *
+ * Das JSON für --import ist eine Liste von Objekten:
+ *   [{"key":"auth.login.title","de":"…","en":"…","pl":"…"}]
+ *
+ * Vorhandene Schlüssel werden nicht überschrieben (Konflikte werden gemeldet),
+ * damit ein zweiter Import bereits geprüfte Übersetzungen nicht zurücksetzt.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/lang-sync muss auf der Kommandozeile laufen.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Lang;
+
+const LOCALES = ['de', 'en', 'pl'];
+
+$args   = array_slice($argv, 1);
+$mode   = $args[0] ?? '--check';
+$second = $args[1] ?? null;
+
+/** @return array<string,string> */
+function loadCatalogue(string $locale): array
+{
+    $file = CONSENTED_ROOT . '/lang/' . $locale . '.php';
+
+    if (!is_file($file)) {
+        return [];
+    }
+
+    /** @var mixed $data */
+    $data = require $file;
+
+    return is_array($data) ? $data : [];
+}
+
+/**
+ * Schreibt einen Katalog: nach Bereich gruppiert, innerhalb der Gruppe
+ * alphabetisch. Deterministisch, damit ein erneuter Lauf ohne inhaltliche
+ * Änderung auch keinen Diff erzeugt.
+ *
+ * @param array<string,string> $entries
+ */
+function writeCatalogue(string $locale, array $entries): void
+{
+    ksort($entries);
+
+    $groups = [];
+    foreach ($entries as $key => $value) {
+        $groups[explode('.', $key)[0]][$key] = $value;
+    }
+    ksort($groups);
+
+    // Spaltenbreite für die Pfeile, damit die Datei lesbar bleibt.
+    $width = 0;
+    foreach (array_keys($entries) as $key) {
+        $width = max($width, strlen($key) + 2);
+    }
+    $width = min($width, 44);
+
+    $out  = "<?php\n\ndeclare(strict_types=1);\n\n";
+    $out .= "/**\n * Sprachkatalog: {$locale}\n *\n";
+    $out .= " * Erzeugt und gepflegt über bin/lang-sync. Handarbeit ist erlaubt — die\n";
+    $out .= " * Gruppierung wird beim nächsten --format wiederhergestellt.\n";
+    $out .= " *\n * Platzhalter werden als :name geschrieben.\n */\n\n";
+    $out .= "return [\n";
+
+    foreach ($groups as $group => $items) {
+        $line = '    // --- ' . $group . ' ';
+        $out .= $line . str_repeat('-', max(4, 78 - strlen($line))) . "\n";
+
+        foreach ($items as $key => $value) {
+            $quoted = "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $key) . "'";
+            $val    = "'" . str_replace(["\\", "'"], ["\\\\", "\\'"], $value) . "'";
+            $out   .= '    ' . str_pad($quoted, $width) . ' => ' . $val . ",\n";
+        }
+
+        $out .= "\n";
+    }
+
+    $out = rtrim($out, "\n") . "\n];\n";
+
+    file_put_contents(CONSENTED_ROOT . '/lang/' . $locale . '.php', $out);
+}
+
+/**
+ * Sucht alle im Code verwendeten Schlüssel.
+ *
+ * Erfasst $this->t('…'), $this->tr('…'), __('…') und Lang::get('…') mit
+ * literalem Schlüssel. Dynamisch zusammengebaute Schlüssel — etwa
+ * 'coming_soon.card_' . $key . '_title' — kann eine statische Suche
+ * naturgemäß nicht auflösen; die werden separat gemeldet.
+ *
+ * @return array{found:array<string,list<string>>,dynamic:list<string>}
+ */
+function scanUsage(): array
+{
+    $found   = [];
+    $dynamic = [];
+
+    $directories = [CONSENTED_ROOT . '/views', CONSENTED_ROOT . '/src', CONSENTED_ROOT . '/routes'];
+
+    foreach ($directories as $dir) {
+        if (!is_dir($dir)) {
+            continue;
+        }
+
+        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
+
+        foreach ($iterator as $file) {
+            if (!$file->isFile() || $file->getExtension() !== 'php') {
+                continue;
+            }
+
+            $code = file_get_contents($file->getPathname());
+            if ($code === false) {
+                continue;
+            }
+
+            $relative = str_replace(CONSENTED_ROOT . DIRECTORY_SEPARATOR, '', $file->getPathname());
+            $relative = str_replace('\\', '/', $relative);
+
+            if (preg_match_all(
+                '/(?:\$this->tr?|__|Lang::get)\(\s*\'([a-z0-9_.]+)\'/i',
+                $code,
+                $matches
+            )) {
+                foreach ($matches[1] as $key) {
+                    $found[$key][] = $relative;
+                }
+            }
+
+            // Verkettung direkt nach dem öffnenden Anführungszeichen.
+            if (preg_match_all(
+                '/(?:\$this->tr?|__|Lang::get)\(\s*\'([a-z0-9_.]*)\'\s*\./i',
+                $code,
+                $dyn
+            )) {
+                foreach ($dyn[1] as $prefix) {
+                    $dynamic[] = $relative . ': ' . $prefix . '…';
+                }
+            }
+        }
+    }
+
+    return ['found' => $found, 'dynamic' => array_values(array_unique($dynamic))];
+}
+
+switch ($mode) {
+    case '--scan':
+        $scan       = scanUsage();
+        $catalogues = [];
+        foreach (LOCALES as $locale) {
+            $catalogues[$locale] = loadCatalogue($locale);
+        }
+
+        $undefined = [];
+        foreach ($scan['found'] as $key => $files) {
+            if (!isset($catalogues['de'][$key])) {
+                $undefined[$key] = array_values(array_unique($files));
+            }
+        }
+
+        $unused = [];
+        foreach (array_keys($catalogues['de']) as $key) {
+            if (!isset($scan['found'][$key])) {
+                $unused[] = $key;
+            }
+        }
+
+        fwrite(STDOUT, sprintf(
+            "Verwendete Schlüssel: %d\nIm de-Katalog:        %d\n\n",
+            count($scan['found']),
+            count($catalogues['de'])
+        ));
+
+        if ($undefined !== []) {
+            fwrite(STDOUT, "FEHLEND — verwendet, aber nicht definiert (" . count($undefined) . "):\n");
+            foreach ($undefined as $key => $files) {
+                fwrite(STDOUT, sprintf("  %-52s %s\n", $key, implode(', ', array_slice($files, 0, 2))));
+            }
+            fwrite(STDOUT, "\n");
+        } else {
+            fwrite(STDOUT, "Keine fehlenden Schlüssel.\n\n");
+        }
+
+        if ($unused !== []) {
+            fwrite(STDOUT, 'Unbenutzt (' . count($unused) . "), evtl. dynamisch zusammengesetzt:\n");
+            foreach (array_slice($unused, 0, 40) as $key) {
+                fwrite(STDOUT, '  ' . $key . "\n");
+            }
+            if (count($unused) > 40) {
+                fwrite(STDOUT, '  … und ' . (count($unused) - 40) . " weitere\n");
+            }
+            fwrite(STDOUT, "\n");
+        }
+
+        if ($scan['dynamic'] !== []) {
+            fwrite(STDOUT, "Dynamisch gebildete Schlüssel (Suche kann sie nicht auflösen):\n");
+            foreach ($scan['dynamic'] as $hint) {
+                fwrite(STDOUT, '  ' . $hint . "\n");
+            }
+        }
+
+        exit($undefined === [] ? 0 : 1);
+
+    case '--check':
+        foreach (Lang::coverage() as $code => $report) {
+            fwrite(STDOUT, sprintf(
+                "%s  %3d%%  %d/%d übersetzt%s\n",
+                $code,
+                $report['percent'],
+                $report['translated'],
+                $report['total'],
+                $report['missing'] === []
+                    ? ''
+                    : '  — fehlend: ' . implode(', ', array_slice($report['missing'], 0, 5))
+                        . (count($report['missing']) > 5 ? ' …' : '')
+            ));
+        }
+
+        /*
+         * Pluralwerte prüfen. Die Abdeckung oben kann das nicht: sie zählt
+         * einen Schlüssel als übersetzt, sobald er nicht leer ist, und eine
+         * polnische Zeile mit zwei statt drei Formen ist nicht leer. Ohne
+         * diese Prüfung verfällt das Pipe-Format lautlos.
+         */
+        $pluralIssues = [];
+        $reference    = loadCatalogue(Lang::DEFAULT_LOCALE);
+
+        foreach (LOCALES as $locale) {
+            $catalogue = loadCatalogue($locale);
+            $expected  = Lang::pluralForms($locale);
+
+            foreach ($catalogue as $key => $value) {
+                if (!is_string($value) || !str_contains($value, '|')) {
+                    continue;
+                }
+
+                $forms = explode('|', $value);
+
+                if (count($forms) !== $expected) {
+                    $pluralIssues[] = sprintf(
+                        '%s  %s: %d Formen, erwartet %d',
+                        $locale,
+                        $key,
+                        count($forms),
+                        $expected
+                    );
+
+                    continue;
+                }
+
+                foreach ($forms as $i => $form) {
+                    if (trim($form) === '') {
+                        $pluralIssues[] = sprintf('%s  %s: Form %d ist leer', $locale, $key, $i + 1);
+                    }
+                }
+            }
+
+            // Ein Pluralwert in der Referenz muss überall einer sein, sonst
+            // bekommt eine Sprache stillschweigend nur eine Form zu sehen.
+            foreach ($reference as $key => $value) {
+                if (!is_string($value) || !str_contains($value, '|')) {
+                    continue;
+                }
+
+                $translated = $catalogue[$key] ?? null;
+
+                if (is_string($translated) && $translated !== '' && !str_contains($translated, '|')) {
+                    $pluralIssues[] = sprintf('%s  %s: keine Pluralformen, Referenz hat welche', $locale, $key);
+                }
+            }
+        }
+
+        if ($pluralIssues !== []) {
+            fwrite(STDERR, "\nPluralformen:\n");
+
+            foreach ($pluralIssues as $issue) {
+                fwrite(STDERR, '  ' . $issue . "\n");
+            }
+
+            exit(1);
+        }
+
+        exit(0);
+
+    case '--format':
+        foreach (LOCALES as $locale) {
+            writeCatalogue($locale, loadCatalogue($locale));
+            fwrite(STDOUT, "formatiert: lang/{$locale}.php\n");
+        }
+
+        exit(0);
+
+    case '--import':
+        if ($second === null || !is_file($second)) {
+            fwrite(STDERR, "Bitte eine JSON-Datei angeben: bin/lang-sync --import <datei>\n");
+            exit(1);
+        }
+
+        $raw  = (string) file_get_contents($second);
+        $data = json_decode($raw, true);
+
+        if (!is_array($data)) {
+            fwrite(STDERR, 'Ungültiges JSON: ' . json_last_error_msg() . "\n");
+            exit(1);
+        }
+
+        $catalogues = [];
+        foreach (LOCALES as $locale) {
+            $catalogues[$locale] = loadCatalogue($locale);
+        }
+
+        $added     = 0;
+        $skipped   = 0;
+        $conflicts = [];
+
+        foreach ($data as $entry) {
+            if (!is_array($entry) || !isset($entry['key']) || !is_string($entry['key'])) {
+                continue;
+            }
+
+            $key = trim($entry['key']);
+
+            if ($key === '' || preg_match('/^[a-z0-9_]+(\.[a-z0-9_]+)+$/', $key) !== 1) {
+                $conflicts[] = "ungültiger Schlüssel: {$key}";
+                continue;
+            }
+
+            $isNew = !isset($catalogues['de'][$key]);
+
+            foreach (LOCALES as $locale) {
+                $value = isset($entry[$locale]) && is_string($entry[$locale]) ? trim($entry[$locale]) : '';
+
+                if ($value === '') {
+                    continue;
+                }
+
+                if (isset($catalogues[$locale][$key]) && $catalogues[$locale][$key] !== $value) {
+                    $conflicts[] = "{$locale}/{$key}: vorhanden, Import weicht ab — behalten";
+                    continue;
+                }
+
+                $catalogues[$locale][$key] = $value;
+            }
+
+            if ($isNew) {
+                $added++;
+            } else {
+                $skipped++;
+            }
+        }
+
+        foreach (LOCALES as $locale) {
+            writeCatalogue($locale, $catalogues[$locale]);
+        }
+
+        fwrite(STDOUT, "{$added} neu, {$skipped} bereits vorhanden.\n");
+
+        if ($conflicts !== []) {
+            fwrite(STDOUT, "\n" . count($conflicts) . " Hinweis(e):\n");
+            foreach (array_slice($conflicts, 0, 30) as $conflict) {
+                fwrite(STDOUT, '  ' . $conflict . "\n");
+            }
+        }
+
+        foreach (LOCALES as $locale) {
+            fwrite(STDOUT, sprintf("lang/%s.php: %d Schlüssel\n", $locale, count($catalogues[$locale])));
+        }
+
+        exit(0);
+
+    default:
+        fwrite(STDERR, "Unbekannter Modus: {$mode}\nSiehe Kopf der Datei für die Optionen.\n");
+        exit(1);
+}

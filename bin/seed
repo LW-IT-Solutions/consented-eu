@@ -1,0 +1,226 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Seeds the global DPS catalogue.
+ *
+ * Idempotent: entries are matched on dps_id and updated in place, so running
+ * it again after adding services to the JSON only adds the new ones.
+ *
+ *   bin/seed
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/seed must be run from the command line.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Clock;
+use Consented\Core\Db;
+use Consented\Core\Uuid;
+
+$file = CONSENTED_ROOT . '/database/seeds/dps_catalog.json';
+$raw  = file_get_contents($file);
+
+if ($raw === false) {
+    fwrite(STDERR, "Cannot read {$file}\n");
+    exit(1);
+}
+
+/** @var list<array<string,mixed>>|null $entries */
+$entries = json_decode($raw, true);
+
+if (!is_array($entries)) {
+    fwrite(STDERR, "Malformed JSON in {$file}: " . json_last_error_msg() . "\n");
+    exit(1);
+}
+
+/*
+ * Provenance columns. Only carried over when the JSON actually names them:
+ * writing a null over a value that is already in the table would destroy the
+ * record of where an entry came from, which is the opposite of what these
+ * columns are for.
+ */
+const PROVENANCE_FIELDS = [
+    'source_type', 'source_url', 'source_license', 'source_retrieved_at',
+    'pattern_source_type', 'pattern_source_url', 'pattern_verified_at',
+    // verified_at gehoert dazu, seit bin/export-catalog den Katalog in die
+    // Seed-Datei zurueckschreibt: sonst traegt die Datei ein Pruefdatum, das
+    // beim Einspielen verschwindet, und ein geprueftes Paket kaeme ohne Datum
+    // in einer frischen Installation an.
+    'review_status', 'verified_at', 'review_notes',
+];
+
+/** Without these an entry cannot say where it came from (CLAUDE.md 13). */
+const PROVENANCE_REQUIRED = ['source_type', 'source_url', 'source_license'];
+
+/**
+ * Quellenarten, die keine URL haben können.
+ *
+ * `own_scan` ist eine eigene Messung — es gibt keine fremde Seite, auf die man
+ * zeigen könnte; was belegt ist, steht in review_notes. `unsourced` ist der
+ * ausdrückliche Eingeständnis-Zustand: wir wissen nicht, woher die Angaben
+ * stammen, und sagen das.
+ *
+ * Ohne diese Ausnahme wäre der Eingeständnis-Zustand nutzlos. Ein Eintrag, den
+ * wir ehrlich als quellenlos gekennzeichnet haben, ließe sich nicht mehr
+ * ausliefern — eine frische Installation bekäme neun Dienste weniger als
+ * unsere, ohne dass es jemandem auffiele. Genau so verfährt auch
+ * `bin/verify-catalog`; die beiden Werkzeuge müssen dieselbe Regel kennen,
+ * sonst widersprechen sie sich.
+ */
+const URL_EXEMPT_SOURCES = ['own_scan', 'unsourced'];
+
+$inserted   = 0;
+$updated    = 0;
+$rejected   = 0;
+$noSourceId = [];
+
+foreach ($entries as $entry) {
+    if (!isset($entry['dps_id'], $entry['name'])) {
+        fwrite(STDERR, "Skipping entry without dps_id/name\n");
+        continue;
+    }
+
+    $now = Clock::now();
+
+    $data = [
+        'name'               => (string) $entry['name'],
+        'provider'           => (string) ($entry['provider'] ?? ''),
+        'provider_country'   => $entry['provider_country'] ?? null,
+        'category'           => (string) ($entry['category'] ?? 'functional'),
+        'purposes'           => json_encode($entry['purposes'] ?? [], JSON_UNESCAPED_UNICODE),
+        'legal_basis'        => (string) ($entry['legal_basis'] ?? 'consent'),
+        'data_collected'     => json_encode($entry['data_collected'] ?? [], JSON_UNESCAPED_UNICODE),
+        'data_retention'     => (string) ($entry['data_retention'] ?? ''),
+        'privacy_policy_url' => (string) ($entry['privacy_policy_url'] ?? ''),
+        'opt_out_url'        => (string) ($entry['opt_out_url'] ?? ''),
+        'cookies'            => json_encode($entry['cookies'] ?? [], JSON_UNESCAPED_UNICODE),
+        'technologies'       => json_encode($entry['technologies'] ?? [], JSON_UNESCAPED_UNICODE),
+        'blocking_pattern'   => json_encode($entry['blocking_pattern'] ?? [], JSON_UNESCAPED_UNICODE),
+        'gcm_signals'        => json_encode($entry['gcm_signals'] ?? [], JSON_UNESCAPED_UNICODE),
+        'tcf_vendor_id'      => $entry['tcf_vendor_id'] ?? null,
+        'google_ac_id'       => $entry['google_ac_id'] ?? null,
+        'third_country'      => !empty($entry['third_country']) ? 1 : 0,
+        'is_active'          => 1,
+        'updated_at'         => $now,
+    ];
+
+    foreach (PROVENANCE_FIELDS as $field) {
+        if (array_key_exists($field, $entry)) {
+            $value        = is_string($entry[$field]) ? trim($entry[$field]) : $entry[$field];
+            $data[$field] = ($value === '' || $value === null) ? null : $value;
+        }
+    }
+
+    $required = PROVENANCE_REQUIRED;
+
+    if (in_array($data['source_type'] ?? null, URL_EXEMPT_SOURCES, true)) {
+        $required = array_values(array_diff($required, ['source_url']));
+    }
+
+    $missing = array_values(array_filter(
+        $required,
+        static fn (string $f): bool => ($data[$f] ?? null) === null
+    ));
+
+    $existing = Db::value('SELECT id FROM dps_catalog WHERE dps_id = :d', ['d' => $entry['dps_id']]);
+
+    if ($existing === null) {
+        /*
+         * Hard stop for anything new, per CLAUDE.md 13. Deliberately not applied
+         * to updates: the 42 entries seeded before these columns existed are
+         * already in the table, and refusing to update them would break the
+         * seed for everyone instead of closing the gap. They are counted and
+         * reported below so the gap stays visible.
+         */
+        if ($missing !== []) {
+            fwrite(STDERR, sprintf(
+                "REJECTED %s: no provenance (%s missing)\n",
+                $entry['dps_id'],
+                implode(', ', $missing)
+            ));
+            $rejected++;
+            continue;
+        }
+
+        Db::insert('dps_catalog', array_merge($data, [
+            'public_id'  => Uuid::v7(),
+            'dps_id'     => (string) $entry['dps_id'],
+            'created_at' => $now,
+        ]));
+        $inserted++;
+    } else {
+        if ($missing !== []) {
+            $noSourceId[] = (string) $entry['dps_id'];
+        }
+
+        /*
+         * Der Prüfstatus gehört dem Menschen, nicht der Seed-Datei.
+         *
+         * `review_status` wird im Dashboard gesetzt: jemand liest den Eintrag,
+         * vergleicht ihn mit der Quelle und stellt ihn auf `verified` — oder auf
+         * `stale`, wenn die Quelle veraltet ist. Die Seed-Datei liefert immer
+         * `draft`, weil das der Zustand eines frisch eingespielten Eintrags ist.
+         *
+         * Ohne diese Ausnahme setzt jeder Seed-Lauf jede Prüfung zurück. Genau
+         * das ist passiert: ein bereits geprüfter Eintrag stand nach dem
+         * nächsten Einspielen wieder auf `draft`, ohne dass sich an ihm etwas
+         * geändert hatte. Redaktionelle Arbeit still zu verwerfen ist schlimmer,
+         * als sie gar nicht erst zu ermöglichen.
+         *
+         * Nur `draft` darf überschrieben werden — ein ungeprüfter Eintrag hat
+         * nichts zu verlieren. Wer einen geprüften Eintrag inhaltlich ändert,
+         * muss ihn im Dashboard neu prüfen; dass die Änderung ankommt, zeigt
+         * `updated_at`.
+         */
+        $current = Db::first(
+            'SELECT review_status, is_active FROM dps_catalog WHERE id = :id',
+            ['id' => $existing]
+        ) ?? [];
+
+        $reviewed = (string) ($current['review_status'] ?? '');
+
+        if ($reviewed !== '' && $reviewed !== 'draft') {
+            unset($data['review_status'], $data['verified_at']);
+        }
+
+        /*
+         * is_active ebenfalls nicht anfassen.
+         *
+         * Derselbe Fehler wie beim Pruefstatus: die Spalte gehoert dem
+         * Betreiber, nicht der Seed-Datei. Wer einen Dienst bewusst
+         * abgeschaltet hat — weil er ihn nicht anbietet oder weil er Aerger
+         * macht —, findet ihn sonst nach dem naechsten Einspielen wieder aktiv,
+         * ohne dass jemand etwas getan haette. Beim Einfuegen bleibt 1 richtig:
+         * ein neuer Eintrag ist noch nie abgewaehlt worden.
+         */
+        unset($data['is_active']);
+
+        Db::update('dps_catalog', $data, ['id' => $existing]);
+        $updated++;
+    }
+}
+
+$total = (int) Db::value('SELECT COUNT(*) FROM dps_catalog');
+
+fwrite(STDOUT, "DPS catalogue: {$inserted} added, {$updated} updated, {$total} total.\n");
+
+if ($rejected > 0) {
+    fwrite(STDOUT, "{$rejected} new entries rejected for missing provenance — see above.\n");
+}
+
+if ($noSourceId !== []) {
+    fwrite(STDOUT, sprintf(
+        "%d existing entries still carry no source_type/source_url/source_license: %s\n",
+        count($noSourceId),
+        implode(', ', array_slice($noSourceId, 0, 8)) . (count($noSourceId) > 8 ? ', …' : '')
+    ));
+}
+
+if ($rejected > 0) {
+    exit(1);
+}

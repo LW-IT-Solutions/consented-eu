@@ -1,0 +1,180 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Import in den DPS-Katalog.
+ *
+ *   bin/import-dps --source=open-cookie-database --dry-run
+ *   bin/import-dps --source=open-cookie-database
+ *   bin/import-dps --source=open-cookie-database --file=/tmp/ocd/open-cookie-database.json
+ *
+ * Die Lizenzprüfung ist hart: Eine Quelle mit unbekannter oder ausgeschlossener
+ * Lizenz führt zum Abbruch, nicht zu einer Warnung. Ein Katalogeintrag ohne
+ * belegbare Herkunft ist im Streitfall wertlos — und genau dann teuer.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/import-dps muss auf der Kommandozeile laufen.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Catalog\Sources\OpenCookieDatabase;
+use Consented\Catalog\Sources\Source;
+use Consented\Core\Clock;
+use Consented\Core\Db;
+use Consented\Core\Uuid;
+
+/** Lizenzen, unter denen wir Daten aufnehmen dürfen. */
+const ALLOWED_LICENSES = ['Apache-2.0', 'MIT', 'CC0-1.0', 'CC-BY-4.0', 'ODbL-1.0', 'public-fact'];
+
+/** Ausdrücklich ausgeschlossen — siehe PROJECT_BRIEF 6.4. */
+const BLOCKED_LICENSES = [
+    'CC-BY-NC-ND-4.0', 'CC-BY-NC-4.0', 'CC-BY-NC-SA-4.0',
+    'proprietary', 'unknown', '',
+];
+
+$options = getopt('', ['source:', 'file::', 'dry-run', 'limit::']);
+$name    = $options['source'] ?? null;
+$dryRun  = array_key_exists('dry-run', $options);
+$limit   = isset($options['limit']) ? (int) $options['limit'] : 0;
+$file    = $options['file'] ?? null;
+
+$sources = [
+    'open-cookie-database' => static fn (): Source => new OpenCookieDatabase(is_string($file) ? $file : null),
+];
+
+if ($name === null || !isset($sources[$name])) {
+    fwrite(STDERR, "Bitte --source= angeben. Verfügbar: " . implode(', ', array_keys($sources)) . "\n");
+    exit(1);
+}
+
+$source = $sources[$name]();
+
+// --- Lizenz-Gate ------------------------------------------------------------
+$license = trim($source->license());
+
+if (in_array($license, BLOCKED_LICENSES, true) || !in_array($license, ALLOWED_LICENSES, true)) {
+    fwrite(STDERR, sprintf(
+        "ABBRUCH: Lizenz '%s' der Quelle '%s' ist nicht freigegeben.\n"
+        . "Erlaubt: %s\n"
+        . "Erst docs/DATA_SOURCES.md prüfen und die Lizenz dort dokumentieren.\n",
+        $license,
+        $name,
+        implode(', ', ALLOWED_LICENSES)
+    ));
+    exit(2);
+}
+
+fwrite(STDOUT, sprintf(
+    "Quelle: %s\nTyp:    %s\nLizenz: %s\nURL:    %s\n%s\n\n",
+    $name,
+    $source->sourceType(),
+    $license,
+    $source->sourceUrl(),
+    $dryRun ? '--- DRY RUN, es wird nichts geschrieben ---' : ''
+));
+
+$now = Clock::now();
+
+$new = $updated = $skipped = 0;
+$examples = [];
+
+foreach ($source->fetch() as $entry) {
+    if ($limit > 0 && ($new + $updated) >= $limit) {
+        break;
+    }
+
+    $dpsId = (string) $entry['dps_id'];
+
+    if ($dpsId === '' || preg_match('/^[a-z0-9][a-z0-9\-]*$/', $dpsId) !== 1) {
+        $skipped++;
+        continue;
+    }
+
+    $existing = Db::first(
+        'SELECT id, source_type, review_status FROM dps_catalog WHERE dps_id = :d',
+        ['d' => $dpsId]
+    );
+
+    // Merge-Priorität aus 6.6: Primärquelle schlägt Open Cookie Database.
+    // Ein bereits geprüfter oder aus Primärquelle stammender Eintrag wird von
+    // einem Massenimport nicht überschrieben.
+    if ($existing !== null) {
+        $protected = $existing['review_status'] === 'verified'
+            || $existing['source_type'] === 'primary_vendor_doc'
+            || $existing['source_type'] === 'gvl';
+
+        if ($protected) {
+            $skipped++;
+            continue;
+        }
+    }
+
+    $data = [
+        'name'               => mb_substr((string) $entry['name'], 0, 160),
+        'provider'           => mb_substr((string) $entry['provider'], 0, 160),
+        'provider_country'   => $entry['provider_country'],
+        'category'           => (string) $entry['category'],
+        'purposes'           => json_encode($entry['purposes'], JSON_UNESCAPED_UNICODE),
+        'legal_basis'        => (string) $entry['legal_basis'],
+        'data_collected'     => json_encode($entry['data_collected'], JSON_UNESCAPED_UNICODE),
+        'data_retention'     => mb_substr((string) $entry['data_retention'], 0, 160),
+        'privacy_policy_url' => mb_substr((string) $entry['privacy_policy_url'], 0, 500),
+        'cookies'            => json_encode($entry['cookies'], JSON_UNESCAPED_UNICODE),
+        'blocking_pattern'   => json_encode($entry['blocking_pattern'], JSON_UNESCAPED_UNICODE),
+        'gcm_signals'        => json_encode($entry['gcm_signals'], JSON_UNESCAPED_UNICODE),
+        'third_country'      => !empty($entry['third_country']) ? 1 : 0,
+        'is_active'          => 1,
+        'source_type'        => $source->sourceType(),
+        'source_url'         => mb_substr((string) $entry['source_url'], 0, 512),
+        'source_license'     => $license,
+        'source_retrieved_at' => $now,
+        'review_status'      => 'draft',
+        'review_notes'       => (string) $entry['review_notes'],
+        'updated_at'         => $now,
+    ];
+
+    if ($dryRun) {
+        if (count($examples) < 5) {
+            $examples[] = sprintf(
+                '%-34s %-11s %2d Cookies  %s',
+                $dpsId,
+                $data['category'],
+                count($entry['cookies']),
+                $existing === null ? 'NEU' : 'update'
+            );
+        }
+        $existing === null ? $new++ : $updated++;
+        continue;
+    }
+
+    if ($existing === null) {
+        Db::insert('dps_catalog', array_merge($data, [
+            'public_id'  => Uuid::v7(),
+            'dps_id'     => $dpsId,
+            'created_at' => $now,
+        ]));
+        $new++;
+    } else {
+        Db::update('dps_catalog', $data, ['id' => $existing['id']]);
+        $updated++;
+    }
+}
+
+fwrite(STDOUT, sprintf("neu: %d   aktualisiert: %d   übersprungen: %d\n", $new, $updated, $skipped));
+
+if ($examples !== []) {
+    fwrite(STDOUT, "\nBeispiele:\n");
+    foreach ($examples as $line) {
+        fwrite(STDOUT, '  ' . $line . "\n");
+    }
+}
+
+if (!$dryRun) {
+    $total = (int) Db::value('SELECT COUNT(*) FROM dps_catalog');
+    fwrite(STDOUT, "\nKatalog gesamt: {$total} Einträge\n");
+    fwrite(STDOUT, "Attribution nicht vergessen — THIRD_PARTY_DATA.md:\n  " . $source->attribution() . "\n");
+}

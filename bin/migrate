@@ -1,0 +1,157 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Migration runner.
+ *
+ *   bin/migrate            apply every pending migration
+ *   bin/migrate --status   list applied and pending migrations
+ *   bin/migrate --fresh    drop every table, then apply everything
+ *
+ * Migrations are plain .sql files in database/migrations, applied in filename
+ * order and recorded in the `migrations` table so they run exactly once.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/migrate must be run from the command line.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Clock;
+use Consented\Core\Db;
+
+$options = array_slice($argv, 1);
+$status  = in_array('--status', $options, true);
+$fresh   = in_array('--fresh', $options, true);
+
+$dir = CONSENTED_ROOT . '/database/migrations';
+
+$files = glob($dir . '/*.sql') ?: [];
+sort($files);
+
+try {
+    Db::pdo();
+} catch (Throwable $e) {
+    fwrite(STDERR, "Cannot connect to the database: {$e->getMessage()}\n");
+    exit(1);
+}
+
+Db::run(
+    'CREATE TABLE IF NOT EXISTS migrations (
+        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        filename    VARCHAR(190)    NOT NULL,
+        applied_at  DATETIME        NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_migration (filename)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+);
+
+if ($fresh) {
+    fwrite(STDOUT, "Dropping all tables in the current database...\n");
+
+    Db::run('SET FOREIGN_KEY_CHECKS = 0');
+    foreach (Db::all('SHOW TABLES') as $row) {
+        $table = (string) array_values($row)[0];
+        Db::run(sprintf('DROP TABLE IF EXISTS `%s`', $table));
+        fwrite(STDOUT, "  dropped {$table}\n");
+    }
+    Db::run('SET FOREIGN_KEY_CHECKS = 1');
+
+    Db::run(
+        'CREATE TABLE migrations (
+            id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            filename    VARCHAR(190)    NOT NULL,
+            applied_at  DATETIME        NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_migration (filename)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+    );
+}
+
+$applied = [];
+foreach (Db::all('SELECT filename FROM migrations') as $row) {
+    $applied[(string) $row['filename']] = true;
+}
+
+if ($status) {
+    fwrite(STDOUT, "Migration status\n----------------\n");
+    foreach ($files as $file) {
+        $name = basename($file);
+        fwrite(STDOUT, sprintf("  [%s] %s\n", isset($applied[$name]) ? 'x' : ' ', $name));
+    }
+    exit(0);
+}
+
+$ran = 0;
+
+foreach ($files as $file) {
+    $name = basename($file);
+
+    if (isset($applied[$name])) {
+        continue;
+    }
+
+    $sql = file_get_contents($file);
+    if ($sql === false) {
+        fwrite(STDERR, "Cannot read {$file}\n");
+        exit(1);
+    }
+
+    fwrite(STDOUT, "Applying {$name} ... ");
+
+    try {
+        foreach (splitStatements($sql) as $statement) {
+            Db::pdo()->exec($statement);
+        }
+
+        Db::insert('migrations', ['filename' => $name, 'applied_at' => Clock::now()]);
+        $ran++;
+        fwrite(STDOUT, "ok\n");
+    } catch (Throwable $e) {
+        fwrite(STDOUT, "FAILED\n");
+        fwrite(STDERR, "  {$e->getMessage()}\n");
+        exit(1);
+    }
+}
+
+fwrite(STDOUT, $ran === 0 ? "Nothing to migrate.\n" : "Applied {$ran} migration(s).\n");
+
+/**
+ * Splits a migration file into individual statements.
+ *
+ * Line comments are stripped first, then the file is split on semicolons that
+ * end a line. Our migrations never contain a semicolon inside a string
+ * literal, so this stays simple on purpose — a full SQL tokenizer here would
+ * be more code than the rest of the runner.
+ *
+ * @return list<string>
+ */
+function splitStatements(string $sql): array
+{
+    $lines = preg_split('/\R/', $sql) ?: [];
+    $clean = [];
+
+    foreach ($lines as $line) {
+        $trimmed = ltrim($line);
+        if (str_starts_with($trimmed, '--')) {
+            continue;
+        }
+        $clean[] = $line;
+    }
+
+    $sql   = implode("\n", $clean);
+    $parts = preg_split('/;\s*(?:\R|$)/', $sql) ?: [];
+
+    $statements = [];
+    foreach ($parts as $part) {
+        $part = trim($part);
+        if ($part !== '') {
+            $statements[] = $part;
+        }
+    }
+
+    return $statements;
+}

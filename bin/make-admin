@@ -1,0 +1,243 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Legt den ersten Administrator an oder befördert ein vorhandenes Konto.
+ *
+ *   bin/make-admin <e-mail>                 vorhandenes Konto zum Admin machen
+ *   bin/make-admin <e-mail> --create        Konto anlegen und zum Admin machen
+ *   bin/make-admin <e-mail> --revoke        Adminrecht entziehen
+ *   bin/make-admin --list                   alle Administratoren anzeigen
+ *
+ * Warum es dieses Werkzeug gibt: Auf einer frischen Installation gibt es keinen
+ * Administrator, und der Admin-Bereich ist die einzige Stelle, an der man einen
+ * ernennen kann — ein Henne-Ei-Problem, das bisher nur mit einem UPDATE in der
+ * Datenbank zu lösen war. Genau das soll ein Self-Hoster nicht tun müssen.
+ *
+ * Das Passwort wird NICHT als Argument entgegengenommen. Ein Passwort in der
+ * Kommandozeile steht in der Prozessliste und in der Shell-Historie; hier wird
+ * es interaktiv und ohne Echo abgefragt.
+ *
+ * Exit 0 = erledigt, 1 = Fehler.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/make-admin muss auf der Kommandozeile laufen.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Auth\User;
+use Consented\Core\Audit;
+use Consented\Core\Clock;
+use Consented\Core\Db;
+
+$args    = array_slice($argv, 1);
+$flags   = array_values(array_filter($args, static fn(string $a): bool => str_starts_with($a, '--')));
+$plain   = array_values(array_filter($args, static fn(string $a): bool => !str_starts_with($a, '--')));
+$email   = strtolower(trim($plain[0] ?? ''));
+$create  = in_array('--create', $flags, true);
+$revoke  = in_array('--revoke', $flags, true);
+
+if (in_array('--list', $flags, true)) {
+    listAdmins();
+    exit(0);
+}
+
+if (in_array('--help', $flags, true) || $email === '') {
+    fwrite(STDOUT, <<<TXT
+    bin/make-admin <e-mail>            vorhandenes Konto zum Administrator machen
+    bin/make-admin <e-mail> --create   Konto anlegen und zum Administrator machen
+    bin/make-admin <e-mail> --revoke   Adminrecht entziehen
+    bin/make-admin --list              alle Administratoren anzeigen
+
+    TXT);
+    exit($email === '' && !in_array('--help', $flags, true) ? 1 : 0);
+}
+
+if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+    fwrite(STDERR, "Keine gültige E-Mail-Adresse: {$email}\n");
+    exit(1);
+}
+
+$row = Db::first(
+    'SELECT id, public_id, email, name, is_admin, email_verified_at
+       FROM users WHERE email = :email AND deleted_at IS NULL',
+    ['email' => $email]
+);
+
+// --- Entziehen -----------------------------------------------------------------
+if ($revoke) {
+    if ($row === null) {
+        fwrite(STDERR, "Kein Konto mit dieser Adresse: {$email}\n");
+        exit(1);
+    }
+
+    if ((int) $row['is_admin'] !== 1) {
+        fwrite(STDOUT, "{$email} ist bereits kein Administrator.\n");
+        exit(0);
+    }
+
+    // Dieselbe Sperre wie in der Oberfläche: der letzte Administrator bleibt,
+    // sonst kommt niemand mehr in den Admin-Bereich.
+    $others = (int) Db::value(
+        'SELECT COUNT(*) FROM users WHERE is_admin = 1 AND deleted_at IS NULL AND id <> :uid',
+        ['uid' => $row['id']]
+    );
+
+    if ($others === 0) {
+        fwrite(STDERR, "Abgelehnt: {$email} ist der letzte Administrator.\n");
+        exit(1);
+    }
+
+    Db::update('users', ['is_admin' => 0, 'updated_at' => Clock::now()], ['id' => $row['id']]);
+    Audit::log('admin.role_changed', null, null, null, 'user', (string) $row['public_id'], ['is_admin' => false], null);
+
+    fwrite(STDOUT, "Adminrecht entzogen: {$email}\n");
+    exit(0);
+}
+
+// --- Anlegen ---------------------------------------------------------------------
+if ($row === null) {
+    if (!$create) {
+        fwrite(STDERR, "Kein Konto mit dieser Adresse: {$email}\n");
+        fwrite(STDERR, "Mit --create anlegen.\n");
+        exit(1);
+    }
+
+    $name = promptLine('Name: ');
+
+    if ($name === '') {
+        fwrite(STDERR, "Ein Name ist nötig.\n");
+        exit(1);
+    }
+
+    $password = promptSecret('Passwort: ');
+    $repeat   = promptSecret('Wiederholen: ');
+
+    if ($password !== $repeat) {
+        fwrite(STDERR, "Die Eingaben stimmen nicht überein.\n");
+        exit(1);
+    }
+
+    if (strlen($password) < 12) {
+        fwrite(STDERR, "Mindestens 12 Zeichen.\n");
+        exit(1);
+    }
+
+    $user = User::create($email, $password, $name);
+
+    // Ein per Kommandozeile angelegtes Konto gilt als bestätigt: Wer Zugriff auf
+    // die Konsole des Servers hat, muss nicht zusätzlich beweisen, dass ihm die
+    // Adresse gehört — und auf einer frischen Installation läuft der Mailversand
+    // typischerweise noch gar nicht.
+    Db::update('users', [
+        'is_admin'          => 1,
+        'email_verified_at' => Clock::now(),
+        'updated_at'        => Clock::now(),
+    ], ['id' => $user->id()]);
+
+    Audit::log('admin.user_created_cli', null, null, null, 'user', $user->publicId(), ['is_admin' => true], null);
+
+    fwrite(STDOUT, "\nAngelegt und zum Administrator gemacht: {$email}\n");
+    exit(0);
+}
+
+// --- Befördern -------------------------------------------------------------------
+//
+// „Ist schon Administrator" ist kein Grund, hier auszusteigen: ein Konto kann
+// die Rolle haben und trotzdem unbestätigt sein — etwa weil es direkt in der
+// Datenbank ernannt wurde. Dann ist das Bestätigen genau das, wofür man dieses
+// Werkzeug aufruft, und ein kommentarloses Beenden wäre die falsche Antwort.
+if ((int) $row['is_admin'] === 1 && $row['email_verified_at'] !== null) {
+    fwrite(STDOUT, "{$email} ist bereits Administrator und bestätigt. Nichts zu tun.\n");
+    exit(0);
+}
+
+$fields = ['is_admin' => 1, 'updated_at' => Clock::now()];
+
+// Ein unbestätigtes Konto käme am Verifikationsgate nicht vorbei und stünde
+// dann als Administrator vor verschlossener Tür.
+if ($row['email_verified_at'] === null) {
+    $fields['email_verified_at'] = Clock::now();
+    fwrite(STDOUT, "Hinweis: Die Adresse war unbestätigt und wird mitbestätigt.\n");
+}
+
+Db::update('users', $fields, ['id' => $row['id']]);
+Audit::log('admin.role_changed', null, null, null, 'user', (string) $row['public_id'], ['is_admin' => true], null);
+
+fwrite(STDOUT, ((int) $row['is_admin'] === 1
+    ? "Adresse bestätigt: {$email}\n"
+    : "Zum Administrator gemacht: {$email}\n"));
+exit(0);
+
+// ---------------------------------------------------------------------------------
+
+function listAdmins(): void
+{
+    $rows = Db::all(
+        'SELECT email, name, email_verified_at, last_login_at
+           FROM users WHERE is_admin = 1 AND deleted_at IS NULL ORDER BY id'
+    );
+
+    if ($rows === []) {
+        fwrite(STDOUT, "Kein Administrator vorhanden. Mit bin/make-admin <e-mail> --create anlegen.\n");
+
+        return;
+    }
+
+    fwrite(STDOUT, sprintf("%d Administrator(en):\n", count($rows)));
+
+    foreach ($rows as $row) {
+        fwrite(STDOUT, sprintf(
+            "  %-38s %-24s %s\n",
+            $row['email'],
+            $row['name'],
+            $row['last_login_at'] ?? 'noch nie angemeldet'
+        ));
+    }
+}
+
+function promptLine(string $prompt): string
+{
+    fwrite(STDOUT, $prompt);
+
+    return trim((string) fgets(STDIN));
+}
+
+/**
+ * Liest eine Eingabe ohne Bildschirmausgabe.
+ *
+ * Fällt stty aus (etwa unter Windows oder ohne Terminal), wird die Eingabe
+ * sichtbar gelesen und darauf hingewiesen — lieber ein sichtbares Passwort mit
+ * Warnung als eines, das der Nutzer für unsichtbar hält.
+ */
+function promptSecret(string $prompt): string
+{
+    $hidden = false;
+
+    if (function_exists('shell_exec') && stripos(PHP_OS_FAMILY, 'Windows') === false) {
+        $before = shell_exec('stty -g 2>/dev/null');
+
+        if (is_string($before) && trim($before) !== '') {
+            shell_exec('stty -echo 2>/dev/null');
+            $hidden = true;
+        }
+    }
+
+    if (!$hidden) {
+        fwrite(STDOUT, "(Achtung: die Eingabe ist sichtbar)\n");
+    }
+
+    fwrite(STDOUT, $prompt);
+    $value = (string) fgets(STDIN);
+
+    if ($hidden) {
+        shell_exec('stty ' . trim((string) $before) . ' 2>/dev/null');
+        fwrite(STDOUT, "\n");
+    }
+
+    return trim($value, "\r\n");
+}

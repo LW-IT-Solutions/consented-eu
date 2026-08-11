@@ -1,0 +1,449 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Belegt Blocking-Muster am Endpunkt des Anbieters und trägt sie nach.
+ *
+ *   bin/import-patterns [--dry-run] [--only=dps_id,dps_id] [--timeout=8]
+ *
+ * Warum eine eigene Prüfung und nicht einfach ein Seed:
+ *
+ * Ein Blocking-Muster, das nichts trifft, ist schlimmer als kein Muster. Es
+ * sieht im Katalog nach Schutz aus, lässt den Tracker aber durch — der
+ * Betreiber hält sich für abgesichert und ist es nicht. Ein Muster, das zu
+ * viel trifft, zerlegt die Website des Kunden. Beides fällt bei einer reinen
+ * Datei-Übernahme nicht auf.
+ *
+ * Deshalb übernimmt dieses Werkzeug ein Muster nur, wenn eine Adresse, die
+ * dieses Muster enthält, beim Anbieter tatsächlich antwortet. Die Quelle des
+ * Belegs ist damit der Anbieter selbst — eine Primärquelle im Sinne von
+ * PROJECT_BRIEF 6.2 und ausdrücklich kein Fremdkatalog.
+ *
+ * Exit 0 = Lauf beendet, 1 = Abbruch, 2 = keine einzige Probe erfolgreich
+ * (dann stimmt etwas mit der Netzverbindung, nicht mit den Anbietern).
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/import-patterns muss auf der Kommandozeile laufen.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Db;
+use Consented\Core\Project;
+
+// Der Anbieter soll erkennen können, wer da anfragt. Ein getarnter User-Agent
+// wäre der erste Schritt zu genau der Praxis, die 6.2 verbietet.
+const PROBE_UA = 'consented.eu-pattern-verifier/1.0 (+' . Project::REPO_URL . ')';
+
+$argvOptions = getopt('', ['dry-run', 'only::', 'timeout::', 'help']);
+
+if (isset($argvOptions['help'])) {
+    fwrite(STDOUT, "bin/import-patterns [--dry-run] [--only=id,id] [--timeout=8]\n");
+    exit(0);
+}
+
+$dryRun  = isset($argvOptions['dry-run']);
+$timeout = max(3, (int) ($argvOptions['timeout'] ?? 8));
+$only    = isset($argvOptions['only'])
+    ? array_filter(array_map('trim', explode(',', (string) $argvOptions['only'])))
+    : [];
+
+$seedFile = CONSENTED_ROOT . '/database/seeds/blocking-patterns.php';
+
+if (!is_file($seedFile)) {
+    fwrite(STDERR, "Prüfliste fehlt: {$seedFile}\n");
+    exit(1);
+}
+
+/** @var array<string,array{patterns:list<string>,probes:list<string>}> $seed */
+$seed = require $seedFile;
+
+if ($only !== []) {
+    $seed = array_intersect_key($seed, array_flip($only));
+}
+
+fwrite(STDOUT, sprintf(
+    "Muster-Beleg\n============\n%d Dienst(e), Zeitlimit %ds%s\n\n",
+    count($seed),
+    $timeout,
+    $dryRun ? ', Trockenlauf' : ''
+));
+
+// --- 1. Alle Proben einsammeln und parallel abrufen --------------------------
+// Sequentiell wären das bei ~100 Adressen mehrere Minuten, und ein einzelner
+// hängender Anbieter würde den ganzen Lauf blockieren.
+$probeUrls = [];
+
+foreach ($seed as $dpsId => $entry) {
+    foreach ($entry['probes'] ?? [] as $url) {
+        $probeUrls[$url] = true;
+    }
+}
+
+$probeUrls = array_keys($probeUrls);
+$results   = probeAll($probeUrls, $timeout);
+
+$byLevel = array_count_values(array_column($results, 'level'));
+$reached = ($byLevel['endpoint'] ?? 0) + ($byLevel['host'] ?? 0);
+
+fwrite(STDOUT, sprintf(
+    "%d von %d Adressen erreicht — %d mit Ressource, %d nur Host, %d ohne Verbindung.\n\n",
+    $reached,
+    count($probeUrls),
+    $byLevel['endpoint'] ?? 0,
+    $byLevel['host'] ?? 0,
+    $byLevel['none'] ?? 0
+));
+
+if ($reached === 0 && $probeUrls !== []) {
+    fwrite(STDERR, "Keine einzige Adresse erreichbar — vermutlich kein Netz. Abbruch ohne Änderung.\n");
+    exit(2);
+}
+
+// --- 2. Je Dienst auswerten ---------------------------------------------------
+$now      = date('Y-m-d H:i:s');
+$updated  = 0;
+$skipped  = [];
+$dropped  = [];
+$unknown  = [];
+
+foreach ($seed as $dpsId => $entry) {
+    $row = Db::first(
+        'SELECT id, dps_id, name, blocking_pattern, review_notes FROM dps_catalog WHERE dps_id = ?',
+        [$dpsId]
+    );
+
+    if ($row === null) {
+        $unknown[] = $dpsId;
+        continue;
+    }
+
+    // Ein Muster gilt als belegt, wenn eine erfolgreich beantwortete Adresse
+    // es als Teilstring enthält. Damit belegt die Probe genau die Aussage, die
+    // das Muster trifft — und nicht bloß, dass es den Anbieter gibt.
+    $proven  = [];
+    $source  = null;
+    $weakest = 'endpoint';
+
+    foreach ($entry['patterns'] as $pattern) {
+        if (!isSpecificEnough($pattern)) {
+            $dropped[] = ['dps_id' => $dpsId, 'pattern' => $pattern, 'why' => 'zu unscharf'];
+            continue;
+        }
+
+        // Bester verfügbarer Beleg gewinnt: eine vorhandene Ressource ist
+        // aussagekräftiger als ein bloß erreichbarer Host.
+        $evidence = null;
+        $level    = null;
+
+        foreach ($entry['probes'] ?? [] as $url) {
+            $probe = $results[$url] ?? null;
+
+            if ($probe === null || $probe['level'] === 'none' || !str_contains($url, $pattern)) {
+                continue;
+            }
+
+            if ($probe['level'] === 'endpoint') {
+                $evidence = $url;
+                $level    = 'endpoint';
+                break;
+            }
+
+            $evidence ??= $url;
+            $level    ??= 'host';
+        }
+
+        if ($evidence === null) {
+            // Die beiden Fälle sehen im Ergebnis gleich aus, verlangen aber
+            // Gegenteiliges: eine fehlende Probe muss in die Prüfliste
+            // nachgetragen werden, ein nicht erreichbarer Anbieter nicht.
+            $hasProbe = false;
+
+            foreach ($entry['probes'] ?? [] as $url) {
+                if (str_contains($url, $pattern)) {
+                    $hasProbe = true;
+                    break;
+                }
+            }
+
+            $dropped[] = [
+                'dps_id'  => $dpsId,
+                'pattern' => $pattern,
+                'why'     => $hasProbe ? 'Anbieter nicht erreichbar' : 'keine Probe enthält das Muster',
+            ];
+            continue;
+        }
+
+        $proven[] = $pattern;
+        $source ??= $evidence;
+
+        if ($level === 'host') {
+            $weakest = 'host';
+        }
+    }
+
+    if ($proven === []) {
+        $skipped[] = $dpsId;
+        continue;
+    }
+
+    // Bestehende Muster bleiben erhalten. Der Katalog kann Einträge aus
+    // früheren Läufen oder aus redaktioneller Pflege enthalten, die hier
+    // schlicht nicht aufgeführt sind — die zu löschen wäre Datenverlust.
+    $existing = json_decode((string) $row['blocking_pattern'], true);
+    $existing = is_array($existing) ? array_filter($existing, 'is_string') : [];
+
+    $merged = array_values(array_unique([...$existing, ...$proven]));
+    sort($merged);
+
+    // Notiz ersetzen statt anhängen. Der Importer läuft regelmäßig; ein
+    // blindes CONCAT ließe das Feld bei jedem Lauf um eine Zeile wachsen, bis
+    // niemand mehr hineinschaut.
+    $note = sprintf(
+        'Muster am Anbieter-Endpunkt belegt (%s) — Belegstufe %s%s.',
+        implode(', ', $proven),
+        $weakest === 'endpoint' ? 'Ressource' : 'Host',
+        $weakest === 'host'
+            ? ', der Anbieter liefert ohne gültigen Kundenschlüssel nicht aus'
+            : ''
+    );
+    $notes = preg_replace(
+        '/^Muster am Anbieter-Endpunkt belegt .*$\R?/mu',
+        '',
+        (string) $row['review_notes']
+    ) ?? '';
+    $notes = trim(rtrim($notes) . "\n" . $note);
+
+    if (!$dryRun) {
+        Db::run(
+            'UPDATE dps_catalog
+                SET blocking_pattern    = ?,
+                    pattern_source_type = ?,
+                    pattern_source_url  = ?,
+                    pattern_verified_at = ?,
+                    review_notes        = ?,
+                    updated_at          = ?
+              WHERE id = ?',
+            [
+                json_encode($merged, JSON_UNESCAPED_SLASHES),
+                'primary_vendor_doc',
+                $source,
+                $now,
+                $notes,
+                $now,
+                $row['id'],
+            ]
+        );
+    }
+
+    $updated++;
+    fwrite(STDOUT, sprintf(
+        "  %-32s %-9s %s\n",
+        $dpsId,
+        $weakest === 'endpoint' ? 'Ressource' : 'Host',
+        implode(' ', $proven)
+    ));
+}
+
+// --- 3. Bericht ----------------------------------------------------------------
+fwrite(STDOUT, sprintf("\n%d Eintrag/Einträge %s.\n", $updated, $dryRun ? 'wären aktualisiert' : 'aktualisiert'));
+
+if ($dropped !== []) {
+    fwrite(STDOUT, sprintf("\nNicht belegt und deshalb verworfen (%d):\n", count($dropped)));
+    foreach ($dropped as $d) {
+        fwrite(STDOUT, sprintf("  %-32s %-30s %s\n", $d['dps_id'], $d['pattern'], $d['why']));
+    }
+}
+
+if ($skipped !== []) {
+    fwrite(STDOUT, sprintf(
+        "\nOhne einziges belegtes Muster, unverändert geblieben (%d):\n  %s\n",
+        count($skipped),
+        implode(', ', $skipped)
+    ));
+}
+
+if ($unknown !== []) {
+    fwrite(STDOUT, sprintf(
+        "\nNicht im Katalog, übersprungen (%d):\n  %s\n",
+        count($unknown),
+        implode(', ', $unknown)
+    ));
+}
+
+if (!$dryRun) {
+    $withPattern = (int) Db::value(
+        "SELECT COUNT(*) FROM dps_catalog WHERE blocking_pattern IS NOT NULL AND blocking_pattern NOT IN ('[]','')"
+    );
+    $total = (int) Db::value('SELECT COUNT(*) FROM dps_catalog');
+    fwrite(STDOUT, sprintf("\nKatalog: %d von %d Einträgen haben jetzt ein Muster.\n", $withPattern, $total));
+}
+
+exit(0);
+
+// -----------------------------------------------------------------------------
+
+/**
+ * Verwirft Muster, die zu viel treffen würden.
+ *
+ * Der Stub prüft mit indexOf gegen die volle URL. Ein Muster wie 'sp.js'
+ * blockiert damit auch '/vendor/jsp.js' auf der Website des Kunden — und der
+ * Ausfall wäre schwer zu finden, weil niemand die CMP verdächtigt. Ein zu
+ * enges Muster lässt nur einen Tracker durch; ein zu weites nimmt die Seite
+ * mit. Deshalb ist die Schwelle hier bewusst streng.
+ */
+function isSpecificEnough(string $pattern): bool
+{
+    // Endungen, die einen Dateinamen kennzeichnen. Ohne diese Liste hält die
+    // Hostname-Erkennung 'pixel.gif' für eine Domain und lässt es durch.
+    static $fileExtensions = [
+        'js', 'mjs', 'php', 'css', 'json', 'html', 'htm', 'svg', 'map',
+        'gif', 'png', 'jpg', 'jpeg', 'webp', 'txt', 'cgi', 'aspx', 'jsp',
+    ];
+
+    // Namensteile, die nichts über den Anbieter aussagen. Jeder davon kommt
+    // auf einer beliebigen Website auch ohne Tracker vor.
+    static $genericStems = [
+        'pixel', 'tag', 'tags', 'track', 'tracker', 'tracking', 'analytics',
+        'ad', 'ads', 'advert', 'script', 'scripts', 'main', 'app', 'index',
+        'beacon', 'stats', 'count', 'counter', 'log', 'embed', 'widget',
+        'api', 'sdk', 'client', 'core', 'common', 'bundle', 'vendor', 'util',
+        'utils', 'spacer', 'blank', 'clear', 'dot', 'img', 'image', 'events',
+        'event', 'collect', 'consent', 'cookie', 'cookies', 'gtm', 'loader',
+    ];
+
+    if (str_contains($pattern, '/')) {
+        // Ein Pfadbestandteil bindet das Muster an einen Ort. 'disqus.com/embed'
+        // oder 's.pinimg.com/ct' können nicht versehentlich woanders greifen.
+        return strlen($pattern) >= 8;
+    }
+
+    $extension = strtolower((string) pathinfo($pattern, PATHINFO_EXTENSION));
+
+    // Vor dem ERSTEN Punkt, nicht vor dem letzten: sonst bliebe bei
+    // 'beacon.min.js' der Stamm 'beacon.min' übrig und liefe an der
+    // Sperrliste vorbei, obwohl 'beacon' genau darin steht.
+    $stem = strstr($pattern, '.', true) ?: $pattern;
+
+    if (in_array($extension, $fileExtensions, true)) {
+        // Dateiname. Er muss den Anbieter benennen — 'matomo.js' und
+        // 'piwik.js' tun das, 'pixel.gif' und 'tag.js' nicht.
+        return strlen($stem) >= 5 && !in_array(strtolower($stem), $genericStems, true);
+    }
+
+    // Bleibt der Hostname. Er braucht mindestens zwei Labels, und das erste
+    // darf nicht so kurz sein, dass die Domain als Ganzes zu häufig vorkommt.
+    if (!preg_match('/^[a-z0-9-]+(\.[a-z0-9-]+)+$/i', $pattern)) {
+        return false;
+    }
+
+    return strlen($pattern) >= 8
+        && !preg_match('/^(www\.)?[a-z0-9-]{1,3}\.[a-z]{2,4}$/i', $pattern);
+}
+
+/**
+ * Ruft alle Adressen parallel ab und stuft den Beleg je Adresse ein.
+ *
+ * Es gibt zwei Stufen, und die Unterscheidung ist keine Spitzfindigkeit:
+ *
+ *   'endpoint' — Status unter 400. Die Ressource liegt dort wirklich.
+ *   'host'     — TLS-Handshake mit gültiger Zertifikatskette, aber die
+ *                Anwendung lehnt ab (401/403/404). Damit ist belegt, dass der
+ *                Hostname existiert und dem Anbieter gehört — das Zertifikat
+ *                sagt das —, nicht aber, dass der geprüfte Pfad stimmt. Für
+ *                ein Muster auf Host-Ebene reicht das: viele CDNs liefern
+ *                ohne gültigen Kundenschlüssel grundsätzlich 403 aus, und
+ *                dieser 403 kommt nachweislich vom richtigen Server.
+ *   'none'     — DNS- oder TLS-Fehler. Kein Beleg, Muster wird verworfen.
+ *
+ * @param  list<string> $urls
+ * @return array<string,array{level:string,status:int,type:string,error:string}>
+ */
+function probeAll(array $urls, int $timeout): array
+{
+    // In Blöcken, nicht alles auf einmal. curl_multi startet die
+    // Namensauflösung für jedes hinzugefügte Handle sofort; bei 144 gleichzeitig
+    // fällt der Resolver eines kleinen Servers um, und der Lauf meldet dann
+    // Anbieter als nicht erreichbar, die es gar nicht sind. Genau das ist beim
+    // ersten Durchlauf mit der erweiterten Prüfliste passiert.
+    $out = [];
+
+    foreach (array_chunk($urls, 12) as $chunk) {
+        $out += probeChunk($chunk, $timeout);
+    }
+
+    return $out;
+}
+
+/**
+ * @param  list<string> $urls
+ * @return array<string,array{level:string,status:int,type:string,error:string}>
+ */
+function probeChunk(array $urls, int $timeout): array
+{
+    $out    = [];
+    $multi  = curl_multi_init();
+    $handles = [];
+
+    foreach ($urls as $url) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 3,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_CONNECTTIMEOUT => min(5, $timeout),
+            CURLOPT_USERAGENT      => PROBE_UA,
+            // Kein CURLOPT_RANGE. Ein Teilabruf wäre sparsamer, aber Server,
+            // die Range nicht können, antworten mit 416 — und ein 416 wäre
+            // hier als Absage des Anbieters missverstanden worden, obwohl die
+            // Ressource existiert. Die Dateien sind klein genug.
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_ENCODING       => '',
+        ]);
+        curl_multi_add_handle($multi, $ch);
+        $handles[(int) $ch] = ['handle' => $ch, 'url' => $url];
+    }
+
+    // Höflichkeitsgrenze: nie mehr als 6 gleichzeitige Verbindungen, damit ein
+    // einzelner Anbieter nicht mehrere Anfragen auf einmal abbekommt.
+    curl_multi_setopt($multi, CURLMOPT_MAXCONNECTS, 6);
+
+    do {
+        $status = curl_multi_exec($multi, $running);
+        if ($running) {
+            curl_multi_select($multi, 1.0);
+        }
+    } while ($running && $status === CURLM_OK);
+
+    foreach ($handles as $entry) {
+        $ch     = $entry['handle'];
+        $code   = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $type   = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        $errNo  = curl_errno($ch);
+
+        $level = 'none';
+
+        if ($errNo === 0 && $code > 0) {
+            $level = $code < 400 ? 'endpoint' : 'host';
+        }
+
+        $out[$entry['url']] = [
+            'level'  => $level,
+            'status' => $code,
+            'type'   => $type,
+            'error'  => $errNo !== 0 ? curl_error($ch) : '',
+        ];
+
+        curl_multi_remove_handle($multi, $ch);
+        curl_close($ch);
+    }
+
+    curl_multi_close($multi);
+
+    return $out;
+}

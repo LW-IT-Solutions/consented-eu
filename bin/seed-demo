@@ -1,0 +1,185 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Demo and test accounts.
+ *
+ *   bin/seed-demo            create/refresh the demo accounts and property
+ *   bin/seed-demo --remove   delete them again
+ *
+ * Idempotent. Separate from bin/seed on purpose: the DPS catalogue belongs in
+ * every installation, these accounts do not.
+ *
+ * WARNING: creates accounts with a known password. Never leave this on a
+ * publicly reachable production instance — run with --remove before launch.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/seed-demo must be run from the command line.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Auth\User;
+use Consented\Core\Clock;
+use Consented\Core\Db;
+use Consented\Core\Uuid;
+use Consented\Org\Organization;
+use Consented\Property\Property;
+
+// Single source of truth, shared with the health check on the admin overview,
+// which warns as long as one of these accounts still accepts this password.
+const DEMO_PASSWORD = \Consented\Core\Demo::PASSWORD;
+const DEMO_ADMIN    = 'admin@consented.eu';
+const DEMO_USER     = 'test@consented.eu';
+
+$remove = in_array('--remove', array_slice($argv, 1), true);
+
+if ($remove) {
+    foreach ([DEMO_ADMIN, DEMO_USER] as $email) {
+        $user = User::findByEmail($email);
+        if ($user === null) {
+            continue;
+        }
+
+        Db::transaction(static function () use ($user): void {
+            $orgIds = Db::all('SELECT id FROM organizations WHERE owner_user_id = :u', ['u' => $user->id()]);
+
+            foreach ($orgIds as $org) {
+                // property_* and dps_* cascade from properties; properties
+                // cascade from organizations. Consents deliberately do not —
+                // remove them explicitly for demo data.
+                foreach (Db::all('SELECT id FROM properties WHERE org_id = :o', ['o' => $org['id']]) as $p) {
+                    Db::run('DELETE FROM consent_events WHERE property_id = :p', ['p' => $p['id']]);
+                    Db::run('DELETE FROM consents WHERE property_id = :p', ['p' => $p['id']]);
+                    Db::run('DELETE FROM consent_stats_daily WHERE property_id = :p', ['p' => $p['id']]);
+                }
+                Db::run('DELETE FROM organizations WHERE id = :o', ['o' => $org['id']]);
+            }
+
+            Db::run('DELETE FROM users WHERE id = :u', ['u' => $user->id()]);
+        });
+
+        fwrite(STDOUT, "removed {$email}\n");
+    }
+
+    exit(0);
+}
+
+/** Creates the user if missing, and always resets it to a known good state. */
+function ensureUser(string $email, string $name, bool $admin): User
+{
+    $user = User::findByEmail($email);
+
+    if ($user === null) {
+        $user = User::create($email, DEMO_PASSWORD, $name);
+        fwrite(STDOUT, "created {$email}\n");
+    } else {
+        $user->setPassword(DEMO_PASSWORD);
+        fwrite(STDOUT, "reset   {$email}\n");
+    }
+
+    $user->markVerified();
+    $user->update(['is_admin' => $admin ? 1 : 0, 'name' => $name]);
+
+    return $user;
+}
+
+$admin = ensureUser(DEMO_ADMIN, 'Instanz-Administrator', true);
+$user  = ensureUser(DEMO_USER, 'Testkonto', false);
+
+foreach ([$admin, $user] as $account) {
+    if (Organization::primaryFor($account) === null) {
+        Organization::createForUser($account, $account->name());
+    }
+}
+
+// --- Demo property ----------------------------------------------------------
+
+$org = Organization::primaryFor($user);
+
+if ($org === null) {
+    fwrite(STDERR, "No organisation for the demo user.\n");
+    exit(1);
+}
+
+$existing = Db::value(
+    'SELECT public_id FROM properties WHERE org_id = :o AND slug = :s AND deleted_at IS NULL',
+    ['o' => $org->id(), 's' => 'demo-website']
+);
+
+if (is_string($existing)) {
+    $property = Property::findByPublicId($existing);
+    fwrite(STDOUT, "property exists: {$existing}\n");
+} else {
+    $property = Property::create($org->id(), $user->id(), 'Demo Website', 'demo.consented.eu');
+    fwrite(STDOUT, 'property created: ' . $property->publicId() . "\n");
+}
+
+if ($property === null) {
+    fwrite(STDERR, "Could not resolve the demo property.\n");
+    exit(1);
+}
+
+// Give the admin account visibility too, so both logins show something useful.
+Db::run(
+    'INSERT INTO property_users (property_id, user_id, role, created_at, updated_at)
+          VALUES (:p, :u, :r, :now, :now2)
+     ON DUPLICATE KEY UPDATE role = VALUES(role)',
+    [
+        'p' => $property->id(), 'u' => $admin->id(), 'r' => 'admin',
+        'now' => Clock::now(), 'now2' => Clock::now(),
+    ]
+);
+
+// Attach a representative spread: one analytics, one functional, one marketing.
+foreach (['google-analytics-4', 'youtube', 'meta-pixel'] as $dpsId) {
+    $entry = Db::first('SELECT id, category FROM dps_catalog WHERE dps_id = :d', ['d' => $dpsId]);
+
+    if ($entry === null) {
+        fwrite(STDERR, "catalogue entry missing: {$dpsId} — run bin/seed first\n");
+        continue;
+    }
+
+    $already = Db::value(
+        'SELECT 1 FROM property_dps WHERE property_id = :p AND dps_catalog_id = :c',
+        ['p' => $property->id(), 'c' => $entry['id']]
+    );
+
+    if ($already !== null) {
+        continue;
+    }
+
+    $maxOrder = (int) Db::value(
+        'SELECT COALESCE(MAX(sort_order), 0) FROM property_dps WHERE property_id = :p',
+        ['p' => $property->id()]
+    );
+
+    Db::insert('property_dps', [
+        'public_id'      => Uuid::v7(),
+        'property_id'    => $property->id(),
+        'dps_catalog_id' => (int) $entry['id'],
+        'is_custom'      => 0,
+        'category_key'   => (string) $entry['category'],
+        'sort_order'     => $maxOrder + 1,
+        'is_essential'   => (string) $entry['category'] === 'essential' ? 1 : 0,
+        'created_at'     => Clock::now(),
+        'updated_at'     => Clock::now(),
+    ]);
+
+    fwrite(STDOUT, "  + {$dpsId}\n");
+}
+
+$property->mergeSettings([
+    'privacyPolicyUrl' => 'https://demo.consented.eu/datenschutz',
+    'imprintUrl'       => 'https://demo.consented.eu/impressum',
+]);
+
+$version = $property->publish($user->id(), 'Demo-Konfiguration aus bin/seed-demo');
+
+fwrite(STDOUT, "published version {$version}\n\n");
+fwrite(STDOUT, "Admin : " . DEMO_ADMIN . " / " . DEMO_PASSWORD . "\n");
+fwrite(STDOUT, "User  : " . DEMO_USER  . " / " . DEMO_PASSWORD . "\n");
+fwrite(STDOUT, 'Property: ' . $property->publicId() . "\n");

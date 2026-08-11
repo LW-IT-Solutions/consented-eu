@@ -1,0 +1,316 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Housekeeping worker. Safe to run every few minutes from cron, e.g. every
+ * 15 minutes:
+ *
+ *   0,15,30,45 * * * * php /path/to/consented/bin/worker >/dev/null 2>&1
+ *
+ * Everything it does is idempotent, so a missed run costs nothing and two
+ * overlapping runs cannot corrupt anything.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/worker must be run from the command line.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Clock;
+use Consented\Core\Db;
+use Consented\Core\Env;
+use Consented\Core\RateLimiter;
+use Consented\Core\Session;
+use Consented\Core\Settings;
+
+$verbose = in_array('--verbose', array_slice($argv, 1), true);
+
+function report(string $label, int $count, bool $verbose): void
+{
+    workerSummary($label, $count);
+
+    if ($verbose || $count > 0) {
+        fwrite(STDOUT, sprintf("%-34s %d\n", $label, $count));
+    }
+}
+
+/**
+ * Collects every reported counter so the heartbeat can store one line.
+ *
+ * Called with a label it records, called without one it returns what it has.
+ * Keeping the accumulator here means the steps above do not have to thread a
+ * total through each other.
+ *
+ * @return list<string>
+ */
+function workerSummary(?string $label = null, int $count = 0): array
+{
+    static $parts = [];
+
+    if ($label !== null) {
+        $parts[] = $label . ' ' . $count;
+    }
+
+    return $parts;
+}
+
+$now = Clock::now();
+
+report('expired sessions removed', Session::purgeExpired(), $verbose);
+report('expired rate limits removed', RateLimiter::purgeExpired(), $verbose);
+
+report('used/expired reset tokens removed', Db::run(
+    'DELETE FROM password_resets WHERE expires_at < :now OR used_at IS NOT NULL',
+    ['now' => $now]
+)->rowCount(), $verbose);
+
+report('expired verification tokens removed', Db::run(
+    'DELETE FROM email_verifications WHERE expires_at < :now AND used_at IS NULL',
+    ['now' => $now]
+)->rowCount(), $verbose);
+
+report('expired invitations removed', Db::run(
+    'DELETE FROM invitations WHERE expires_at < :now AND accepted_at IS NULL',
+    ['now' => $now]
+)->rowCount(), $verbose);
+
+/*
+ * Consent retention.
+ *
+ * Two independent conditions, because a consent that never got an explicit
+ * expiry must not live forever either:
+ *   1. its own expires_at has passed and the grace period is over
+ *   2. it is older than the global retention window
+ */
+// Die Einstellung schlägt die .env. CONSENT_RETENTION_MONTHS bleibt als
+// Rückfallwert für Installationen, die die Einstellung nie angefasst haben,
+// und rechnet dafür in Tage um.
+$retentionDays = Settings::retentionDays('retention_consent_days');
+
+if ($retentionDays === 0) {
+    $retentionDays = max(1, Env::int('CONSENT_RETENTION_MONTHS', 36)) * 30;
+}
+
+$cutoff = gmdate('Y-m-d H:i:s', strtotime("-{$retentionDays} days") ?: time());
+
+$expired = Db::all(
+    'SELECT consent_id FROM consents WHERE created_at < :cutoff LIMIT 5000',
+    ['cutoff' => $cutoff]
+);
+
+$purged = 0;
+
+foreach ($expired as $row) {
+    Db::transaction(static function () use ($row, &$purged): void {
+        Db::run('DELETE FROM consent_events WHERE consent_id = :cid', ['cid' => $row['consent_id']]);
+        Db::run('DELETE FROM consents WHERE consent_id = :cid', ['cid' => $row['consent_id']]);
+        $purged++;
+    });
+}
+
+report("consents purged (> {$retentionDays} days)", $purged, $verbose);
+
+/*
+ * Protokolle nach eingestellter Frist.
+ *
+ * 0 heißt „nie löschen" und ist bei beiden die Vorgabe: ein Prüfpfad, den der
+ * Betreiber nicht ausdrücklich befristet hat, wird nicht von uns gekürzt.
+ *
+ * property_versions steht hier bewusst NICHT. Aus dieser Tabelle lässt sich
+ * rekonstruieren, unter welcher Konfiguration eine Einwilligung erteilt wurde;
+ * sie zu befristen hieße, den Nachweis zu löschen und die Einwilligung zu
+ * behalten.
+ */
+foreach ([
+    'mail_log'  => 'retention_mail_log_days',
+    'audit_log' => 'retention_audit_log_days',
+] as $table => $settingKey) {
+    $days = Settings::retentionDays($settingKey);
+
+    if ($days === 0) {
+        if ($verbose) {
+            fwrite(STDOUT, sprintf("%-34s %s\n", "{$table} retention", 'off'));
+        }
+
+        continue;
+    }
+
+    $deleted = Db::run(
+        // Tabellennamen aus einer festen Zuordnung oben, kein Nutzereingabe-Pfad.
+        "DELETE FROM {$table} WHERE created_at < :cutoff LIMIT 5000",
+        ['cutoff' => gmdate('Y-m-d H:i:s', strtotime("-{$days} days") ?: time())]
+    )->rowCount();
+
+    report("{$table} purged (> {$days} days)", $deleted, $verbose);
+}
+
+/*
+ * Daily aggregation.
+ *
+ * The dashboard reads this table instead of scanning `consents`, so the cost
+ * of a chart does not grow with the size of the log.
+ */
+$since = Clock::ago(3 * 86400);
+
+$aggregated = Db::run(
+    'INSERT INTO consent_stats_daily
+        (property_id, stat_date, domain, language, country_code, layout_variant,
+         impressions, accept_all, reject_all, custom_save, no_interaction, withdrawals,
+         avg_time_to_decision_ms, created_at, updated_at)
+     SELECT property_id,
+            DATE(created_at),
+            COALESCE(domain, \'\'),
+            COALESCE(language, \'\'),
+            COALESCE(country_code, \'\'),
+            COALESCE(ui_variant, \'\'),
+            COUNT(*),
+            SUM(action = \'accept_all\'),
+            SUM(action = \'reject_all\'),
+            SUM(action = \'save_selection\'),
+            0,
+            SUM(action = \'withdraw\'),
+            COALESCE(ROUND(AVG(time_to_decision_ms)), 0),
+            :now, :now2
+       FROM consents
+      WHERE created_at >= :since
+      GROUP BY property_id, DATE(created_at), domain, language, country_code, ui_variant
+     ON DUPLICATE KEY UPDATE
+        impressions             = VALUES(impressions),
+        accept_all              = VALUES(accept_all),
+        reject_all              = VALUES(reject_all),
+        custom_save             = VALUES(custom_save),
+        withdrawals             = VALUES(withdrawals),
+        avg_time_to_decision_ms = VALUES(avg_time_to_decision_ms),
+        updated_at              = VALUES(updated_at)',
+    ['now' => $now, 'now2' => $now, 'since' => $since]
+)->rowCount();
+
+report('daily stat buckets written', $aggregated, $verbose);
+
+/*
+ * Vorberechnung für /admin/stats.
+ *
+ * Getrennt von der Aggregation oben, weil die etwas anderes tut: sie schneidet
+ * `consents` nach Property, Tag, Domain, Sprache, Land und Layout auf und ist
+ * damit die Grundlage der Kundenansichten. Hier entstehen instanzweite Zahlen,
+ * und zwei davon lassen sich nicht im Request rechnen.
+ */
+
+/*
+ * 1. Tagesreihe der Entscheidungen, fortgeschrieben über einen Wasserstand.
+ *
+ * `consent_events` ist append-only mit monoton steigendem Primärschlüssel, also
+ * ist ein Wasserstand auf `id` exakt — jede Zeile wird genau einmal gezählt, und
+ * es braucht kein Nachtragsfenster. In einer Transaktion, damit ein Abbruch
+ * zwischen Summieren und Merken nicht doppelt zählt.
+ */
+$counted = Db::transaction(static function () use ($now): int {
+    $from = (int) Db::value(
+        'SELECT value FROM stats_counters WHERE metric = :m FOR UPDATE',
+        ['m' => 'watermark.consent_events']
+    );
+
+    $to = (int) Db::value('SELECT COALESCE(MAX(id), 0) FROM consent_events');
+
+    if ($to <= $from) {
+        return 0;
+    }
+
+    $rows = Db::run(
+        'INSERT INTO stats_daily (metric, bucket, value, computed_at)
+         SELECT CONCAT(\'decisions.\', action), DATE(created_at), COUNT(*), :now
+           FROM consent_events
+          WHERE id > :from AND id <= :to
+          GROUP BY action, DATE(created_at)
+         ON DUPLICATE KEY UPDATE
+            value       = value + VALUES(value),
+            computed_at = VALUES(computed_at)',
+        ['now' => $now, 'from' => $from, 'to' => $to]
+    )->rowCount();
+
+    Db::run(
+        'UPDATE stats_counters SET value = :to, computed_at = :now WHERE metric = :m',
+        ['to' => $to, 'now' => $now, 'm' => 'watermark.consent_events']
+    );
+
+    return $rows;
+});
+
+report('decision buckets advanced', $counted, $verbose);
+
+/*
+ * 2. Bestand aus `consents`, vollständig durchgezählt.
+ *
+ * Hier geht kein Wasserstand: Zeilen werden per UPDATE geändert (eine erneute
+ * Entscheidung überschreibt dieselbe consent_id) und von zwei Pfaden gelöscht —
+ * der Art.-17-Löschung im Ingest und der Aufbewahrung weiter oben. Also derselbe
+ * vollständige Scan, den die Seite nicht bezahlen soll, nur hier: nachts, ohne
+ * wartenden Menschen, und mit einem ehrlichen computed_at daneben.
+ *
+ * Ein Pass für alle Zahlen. Sie einzeln zu zählen hieße, dieselbe Tabelle
+ * siebenmal zu lesen.
+ */
+$stock = Db::first(
+    'SELECT COUNT(*)                                   AS held,
+            COALESCE(SUM(action = \'accept_all\'), 0)    AS accept_all,
+            COALESCE(SUM(action = \'reject_all\'), 0)    AS reject_all,
+            COALESCE(SUM(action = \'save_selection\'), 0) AS save_selection,
+            COALESCE(SUM(action = \'withdraw\'), 0)      AS withdraw,
+            COALESCE(SUM(action = \'auto_expire\'), 0)   AS auto_expire,
+            COALESCE(SUM(action = \'implicit\'), 0)      AS implicit,
+            COALESCE(SUM(gpc_signal = 1), 0)            AS gpc,
+            COALESCE(SUM(is_mobile = 1), 0)             AS mobile,
+            COALESCE(UNIX_TIMESTAMP(MIN(created_at)), 0) AS first_ever,
+            COALESCE(UNIX_TIMESTAMP(MAX(created_at)), 0) AS last_ever
+       FROM consents'
+) ?? [];
+
+$written = 0;
+
+foreach ($stock as $key => $value) {
+    Db::run(
+        'INSERT INTO stats_counters (metric, value, computed_at)
+         VALUES (:m, :v, :now)
+         ON DUPLICATE KEY UPDATE value = VALUES(value), computed_at = VALUES(computed_at)',
+        ['m' => 'consents.' . $key, 'v' => (int) $value, 'now' => $now]
+    );
+    $written++;
+}
+
+report('stock counters written', $written, $verbose);
+
+/*
+ * Heartbeat.
+ *
+ * Reaching this line means every step above went through, so it is the only
+ * honest place to record a successful run. /admin/system needs that fact:
+ * before this, the admin interface guessed the worker's health from the newest
+ * row in consent_stats_daily, which says nothing on an installation that
+ * simply had no traffic — a quiet site and a dead cron looked identical.
+ *
+ * Written straight to site_settings rather than through Settings::set(): that
+ * class validates against Settings::defaults(), which is the contract for the
+ * keys the settings form owns. These two are written here and only read
+ * elsewhere, so they do not belong in that list.
+ */
+$finishedAt = Clock::now();
+
+foreach ([
+    'worker_last_run'     => $finishedAt,
+    'worker_last_summary' => implode(' · ', workerSummary()),
+] as $settingKey => $settingValue) {
+    Db::run(
+        'INSERT INTO site_settings (setting_key, setting_value, updated_at)
+              VALUES (:k, :v, :now)
+         ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), updated_at = VALUES(updated_at)',
+        ['k' => $settingKey, 'v' => $settingValue, 'now' => $finishedAt]
+    );
+}
+
+if ($verbose) {
+    fwrite(STDOUT, "heartbeat written at {$finishedAt} UTC\n");
+    fwrite(STDOUT, "done.\n");
+}

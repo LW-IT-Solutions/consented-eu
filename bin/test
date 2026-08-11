@@ -1,0 +1,87 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Testläufer.
+ *
+ *   bin/test [name]
+ *
+ * Führt jede Datei in `tests/*.php` in einem eigenen Prozess aus. Exit 0 heißt
+ * bestanden, alles andere durchgefallen; die Ausgabe des Tests wird
+ * durchgereicht.
+ *
+ * WARUM KEIN PHPUNIT
+ * ------------------
+ * Weil das Projekt keine Composer-Abhängigkeiten hat und keine bekommen soll
+ * (ADR 0001, CLAUDE.md Regel 6). Ein Testläufer, der eine Installation
+ * voraussetzt, macht aus „PHP und MariaDB reichen" eine Unwahrheit — und
+ * jemand, der nur einmal nachsehen will, ob sein Fork noch heil ist, soll das
+ * ohne Werkzeugkette können.
+ *
+ * Der Preis ist Kargheit: keine Fixtures, keine Mocks, keine Assertions-Sprache.
+ * Ein Test ist eine Datei, die rechnet und mit 1 endet, wenn etwas nicht stimmt.
+ * Für die Dinge, die sich hier lohnen — Pluralregeln, Musterprüfung,
+ * Provenance — reicht das.
+ *
+ * Ein Test, der eine Datenbank braucht, gehört nicht hierher, solange es keine
+ * Testdatenbank gibt. Bis dahin bleibt bin/verify-catalog das Gate für alles
+ * Datenbankgebundene.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/test must be run from the command line.\n");
+}
+
+$root  = dirname(__DIR__);
+$only  = $argv[1] ?? null;
+$files = glob($root . '/tests/*.php') ?: [];
+
+if ($only !== null) {
+    $files = array_values(array_filter(
+        $files,
+        static fn (string $f): bool => basename($f, '.php') === $only
+    ));
+
+    if ($files === []) {
+        fwrite(STDERR, "Kein Test namens '{$only}' in tests/.\n");
+        exit(1);
+    }
+}
+
+if ($files === []) {
+    fwrite(STDOUT, "Keine Tests in tests/.\n");
+    exit(0);
+}
+
+$bestanden = 0;
+$gefallen  = [];
+
+foreach ($files as $file) {
+    $name = basename($file, '.php');
+
+    $output = [];
+    $status = 0;
+    exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($file) . ' 2>&1', $output, $status);
+
+    if ($status === 0) {
+        $bestanden++;
+        fwrite(STDOUT, "  ok    {$name}\n");
+    } else {
+        $gefallen[] = $name;
+        fwrite(STDOUT, "  FEHL  {$name} (exit {$status})\n");
+    }
+
+    foreach ($output as $line) {
+        fwrite(STDOUT, "          {$line}\n");
+    }
+}
+
+fwrite(STDOUT, sprintf(
+    "\n%d von %d bestanden.\n",
+    $bestanden,
+    count($files)
+));
+
+exit($gefallen === [] ? 0 : 1);

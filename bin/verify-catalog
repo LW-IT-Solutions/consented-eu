@@ -1,0 +1,256 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * CI-Gate für den Dienste-Katalog (PROJECT_BRIEF 6.6).
+ *
+ *   bin/verify-catalog
+ *
+ * Exit 0 = sauber, Exit 1 = Verstoß. Gedacht als Pflichtschritt vor jedem
+ * Release: ein Katalogeintrag ohne belegbare Herkunft ist im Streitfall
+ * wertlos, und genau dann wird er teuer.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    exit("bin/verify-catalog muss auf der Kommandozeile laufen.\n");
+}
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+use Consented\Core\Db;
+
+const BLOCKED_LICENSES = [
+    'CC-BY-NC-ND-4.0', 'CC-BY-NC-4.0', 'CC-BY-NC-SA-4.0', 'proprietary', 'unknown',
+];
+
+$problems = [];
+$warnings = [];
+
+// --- 1. Provenance vollständig ----------------------------------------------
+foreach ([
+    'source_type IS NULL'         => 'ohne source_type',
+    "COALESCE(source_license,'') = ''" => 'ohne source_license',
+    'source_retrieved_at IS NULL' => 'ohne source_retrieved_at',
+] as $condition => $label) {
+    $rows = Db::all("SELECT dps_id FROM dps_catalog WHERE {$condition} LIMIT 5");
+    $count = (int) Db::value("SELECT COUNT(*) FROM dps_catalog WHERE {$condition}");
+
+    if ($count > 0) {
+        $problems[] = sprintf(
+            '%d Eintrag/Einträge %s (z. B. %s)',
+            $count,
+            $label,
+            implode(', ', array_column($rows, 'dps_id'))
+        );
+    }
+}
+
+/*
+ * Fehlende Quell-URL.
+ *
+ * Die Bedingung hing früher an der Lizenz: alles außer `public-fact` brauchte
+ * eine URL. Das war die falsche Achse. `public-fact` sagt „diese Tatsache ist
+ * nicht schutzfähig" und nichts darüber, ob wir belegen können, woher sie
+ * stammt — und weil fast jeder handgepflegte Eintrag `public-fact` trägt, ließ
+ * die Regel genau die Einträge durch, für die es einen Beleg geben MUSS.
+ *
+ * Jetzt entscheidet die Quellenart. Wer sich auf ein Anbieterdokument oder eine
+ * benannte Datenbank beruft, muss die Seite nennen; sonst ist die Berufung
+ * unüberprüfbar. Zwei Arten sind ausgenommen, und nur zwei:
+ *
+ *   own_scan    eine eigene Messung hat keine fremde Seite. Was belegt ist,
+ *               steht in review_notes (Dateigröße, Prüfsumme).
+ *   unsourced   der ausdrückliche Eingeständnis-Zustand: wir wissen nicht,
+ *               woher die Angaben stammen. Das ist eine Schuld, die unten
+ *               gezählt und benannt wird — nicht ein stiller Freifahrtschein.
+ */
+$exempt = "source_type IN ('own_scan', 'unsourced')";
+
+$noUrl = Db::all(
+    "SELECT dps_id FROM dps_catalog
+      WHERE COALESCE(source_url,'') = '' AND NOT ({$exempt}) LIMIT 5"
+);
+$noUrlCount = (int) Db::value(
+    "SELECT COUNT(*) FROM dps_catalog
+      WHERE COALESCE(source_url,'') = '' AND NOT ({$exempt})"
+);
+
+if ($noUrlCount > 0) {
+    $problems[] = sprintf(
+        '%d Eintrag/Einträge ohne source_url trotz benannter Quelle (z. B. %s)',
+        $noUrlCount,
+        implode(', ', array_column($noUrl, 'dps_id'))
+    );
+}
+
+/*
+ * Die eingestandene Schuld.
+ *
+ * Kein Fehler, sonst wäre das Gatter dauerhaft rot und damit wertlos — die
+ * betroffenen Seiten sind schlicht nicht abrufbar. Aber eine Zahl, die bei
+ * jedem Lauf im Bericht steht und nur eine richtige Richtung kennt.
+ */
+$unsourced = Db::all("SELECT dps_id FROM dps_catalog WHERE source_type = 'unsourced' ORDER BY dps_id");
+
+if ($unsourced !== []) {
+    $warnings[] = sprintf(
+        '%d Eintrag/Einträge ohne belegte Quelle (source_type=unsourced): %s. '
+        . 'Sie dürfen nicht auf verified gesetzt werden; Gründe in docs/OPEN_QUESTIONS.md.',
+        count($unsourced),
+        implode(', ', array_column($unsourced, 'dps_id'))
+    );
+}
+
+$factNoUrl = (int) Db::value(
+    "SELECT COUNT(*) FROM dps_catalog
+      WHERE COALESCE(source_url,'') = '' AND source_license = 'public-fact'
+        AND NOT ({$exempt})"
+);
+
+if ($factNoUrl > 0) {
+    $warnings[] = sprintf(
+        '%d Eintrag/Einträge mit public-fact haben keine Quell-URL. Zulässig, aber '
+        . 'vor dem Setzen auf verified sollte eine Primärquelle nachgetragen werden.',
+        $factNoUrl
+    );
+}
+
+// --- 1b. Blocking-Muster brauchen einen eigenen Nachweis --------------------
+// Ein Muster stammt nie aus derselben Quelle wie die Cookie-Daten. Steht dort
+// kein Nachweis, weiß niemand, ob das Muster geprüft oder geraten ist — und
+// ein geratenes Muster blockiert entweder nichts oder das Falsche.
+$patternNoSource = (int) Db::value(
+    "SELECT COUNT(*) FROM dps_catalog
+      WHERE blocking_pattern IS NOT NULL
+        AND blocking_pattern NOT IN ('[]','')
+        AND pattern_source_type IS NULL"
+);
+
+if ($patternNoSource > 0) {
+    $examples = Db::all(
+        "SELECT dps_id FROM dps_catalog
+          WHERE blocking_pattern IS NOT NULL
+            AND blocking_pattern NOT IN ('[]','')
+            AND pattern_source_type IS NULL LIMIT 5"
+    );
+    $problems[] = sprintf(
+        '%d Eintrag/Einträge haben ein Blocking-Muster ohne Herkunftsnachweis (z. B. %s). '
+        . 'bin/import-patterns trägt ihn nach.',
+        $patternNoSource,
+        implode(', ', array_column($examples, 'dps_id'))
+    );
+}
+
+$patternCommunity = (int) Db::value(
+    "SELECT COUNT(*) FROM dps_catalog WHERE pattern_source_type = 'community'"
+);
+
+if ($patternCommunity > 0) {
+    $warnings[] = sprintf(
+        '%d Muster stammen aus redaktioneller Pflege und sind nicht am Anbieter-Endpunkt '
+        . 'belegt. bin/import-patterns hebt sie an, sobald sie in der Prüfliste stehen.',
+        $patternCommunity
+    );
+}
+
+// --- 2. Keine Lizenz von der Blacklist --------------------------------------
+$placeholders = implode(',', array_fill(0, count(BLOCKED_LICENSES), '?'));
+$blocked = Db::all(
+    "SELECT dps_id, source_license FROM dps_catalog WHERE source_license IN ({$placeholders})",
+    BLOCKED_LICENSES
+);
+
+foreach ($blocked as $row) {
+    $problems[] = sprintf('AUSGESCHLOSSENE LIZENZ: %s trägt %s', $row['dps_id'], $row['source_license']);
+}
+
+// --- 3. Nur geprüfte Einträge dürfen öffentlich sein ------------------------
+// review_status = verified ist laut 6.5 Voraussetzung für die Sichtbarkeit im
+// öffentlichen Katalog. Das ist hier eine Warnung, kein Fehler: eine Instanz
+// darf mit unverifizierten Vorschlägen arbeiten, solange sie als solche
+// gekennzeichnet sind.
+$draft = (int) Db::value("SELECT COUNT(*) FROM dps_catalog WHERE review_status = 'draft'");
+$total = (int) Db::value('SELECT COUNT(*) FROM dps_catalog');
+
+if ($draft > 0) {
+    $warnings[] = sprintf('%d von %d Einträgen sind noch draft und redaktionell zu prüfen.', $draft, $total);
+}
+
+// --- 4. Veraltete Einträge ---------------------------------------------------
+$stale = (int) Db::value(
+    "SELECT COUNT(*) FROM dps_catalog
+      WHERE source_retrieved_at IS NOT NULL
+        AND source_retrieved_at < DATE_SUB(NOW(), INTERVAL 12 MONTH)
+        AND review_status <> 'stale'"
+);
+
+if ($stale > 0) {
+    $warnings[] = sprintf('%d Eintrag/Einträge sind älter als 12 Monate und sollten auf stale gesetzt werden.', $stale);
+}
+
+// --- 5. Pflichtdateien -------------------------------------------------------
+foreach (['THIRD_PARTY_DATA.md', 'docs/DATA_SOURCES.md', 'LICENSE-CATALOG'] as $file) {
+    if (!is_file(CONSENTED_ROOT . '/' . $file)) {
+        $problems[] = "Pflichtdatei fehlt: {$file}";
+    }
+}
+
+// --- 6. Jede genutzte Quelle ist dokumentiert -------------------------------
+$attribution = (string) @file_get_contents(CONSENTED_ROOT . '/THIRD_PARTY_DATA.md');
+
+foreach (Db::all('SELECT DISTINCT source_type FROM dps_catalog WHERE source_type IS NOT NULL') as $row) {
+    $type = (string) $row['source_type'];
+
+    $needle = match ($type) {
+        'open_cookie_database' => 'Open Cookie Database',
+        'gvl'                  => 'Global Vendor List',
+        'google_atp'           => 'Additional Consent',
+        'primary_vendor_doc'   => 'Primärquellen',
+        'own_scan'             => 'Scanner',
+        'unsourced'            => 'Ohne belegte Quelle',
+        'community'            => 'Community',
+        default                => null,
+    };
+
+    if ($needle !== null && !str_contains($attribution, $needle)) {
+        $problems[] = "Quelle '{$type}' wird genutzt, ist aber nicht in THIRD_PARTY_DATA.md dokumentiert.";
+    }
+}
+
+// --- Ausgabe -----------------------------------------------------------------
+fwrite(STDOUT, "Katalogprüfung\n==============\n");
+fwrite(STDOUT, sprintf("Einträge gesamt: %d\n\n", $total));
+
+foreach (Db::all(
+    'SELECT source_type, source_license, review_status, COUNT(*) n
+       FROM dps_catalog GROUP BY 1,2,3 ORDER BY n DESC'
+) as $row) {
+    fwrite(STDOUT, sprintf(
+        "  %-22s %-14s %-9s %4d\n",
+        $row['source_type'] ?? '—',
+        $row['source_license'] ?? '—',
+        $row['review_status'],
+        $row['n']
+    ));
+}
+
+if ($warnings !== []) {
+    fwrite(STDOUT, "\nHinweise:\n");
+    foreach ($warnings as $warning) {
+        fwrite(STDOUT, '  • ' . $warning . "\n");
+    }
+}
+
+if ($problems !== []) {
+    fwrite(STDERR, "\nFEHLER:\n");
+    foreach ($problems as $problem) {
+        fwrite(STDERR, '  ✗ ' . $problem . "\n");
+    }
+    fwrite(STDERR, "\nKatalogprüfung fehlgeschlagen.\n");
+    exit(1);
+}
+
+fwrite(STDOUT, "\nKatalogprüfung bestanden.\n");
+exit(0);
